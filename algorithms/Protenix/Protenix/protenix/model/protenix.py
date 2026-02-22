@@ -12,34 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import random
 import time
 from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from protenix.model import sample_confidence
 from protenix.model.generator import (
     InferenceNoiseScheduler,
-    TrainingNoiseSampler,
     sample_diffusion,
     sample_diffusion_training,
+    TrainingNoiseSampler,
 )
+from protenix.model.modules.confidence import ConfidenceHead
+from protenix.model.modules.diffusion import DiffusionModule
+from protenix.model.modules.embedders import (
+    ConstraintEmbedder,
+    InputFeatureEmbedder,
+    RelativePositionEncoding,
+)
+from protenix.model.modules.head import DistogramHead
+from protenix.model.modules.pairformer import (
+    MSAModule,
+    PairformerStack,
+    TemplateEmbedder,
+)
+from protenix.model.modules.primitives import LinearNoBias
+from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import simple_merge_dict_list
-from protenix.openfold_local.model.primitives import LayerNorm
 from protenix.utils.logger import get_logger
 from protenix.utils.permutation.permutation import SymmetricPermutation
 from protenix.utils.torch_utils import autocasting_disable_decorator
 
-from .modules.confidence import ConfidenceHead
-from .modules.diffusion import DiffusionModule
-from .modules.embedders import InputFeatureEmbedder, RelativePositionEncoding
-from .modules.head import DistogramHead
-from .modules.pairformer import MSAModule, PairformerStack, TemplateEmbedder
-from .modules.primitives import LinearNoBias
-
 logger = get_logger(__name__)
+
+
+def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
+    """
+    Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
+    Args:
+            input_feature_dict (dict[str, Any]): input features
+    Returns:
+            input_feature_dict (dict[str, Any]): input features
+    """
+    from protenix.model.modules.transformer import rearrange_qk_to_dense_trunk
+
+    with torch.no_grad():
+        # Prepare tensors in dense trunks for local operations
+        q_trunked_list, k_trunked_list, pad_info = rearrange_qk_to_dense_trunk(
+            q=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
+            k=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
+            dim_q=[-2, -1],
+            dim_k=[-2, -1],
+            n_queries=32,
+            n_keys=128,
+            compute_mask=True,
+        )
+        # Compute atom pair feature
+        d_lm = (
+            q_trunked_list[0][..., None, :] - k_trunked_list[0][..., None, :, :]
+        )  # [..., n_blocks, n_queries, n_keys, 3]
+        v_lm = (
+            q_trunked_list[1][..., None].int() == k_trunked_list[1][..., None, :].int()
+        ).unsqueeze(
+            dim=-1
+        )  # [..., n_blocks, n_queries, n_keys, 1]
+        input_feature_dict["d_lm"] = d_lm
+        input_feature_dict["v_lm"] = v_lm
+        input_feature_dict["pad_info"] = pad_info
+        return input_feature_dict
 
 
 class Protenix(nn.Module):
@@ -47,12 +93,15 @@ class Protenix(nn.Module):
     Implements Algorithm 1 [Main Inference/Train Loop] in AF3
     """
 
-    def __init__(self, configs) -> None:
-
+    def __init__(self, configs: Any) -> None:
         super(Protenix, self).__init__()
         self.configs = configs
-
+        torch.backends.cuda.matmul.allow_tf32 = self.configs.enable_tf32
         # Some constants
+        self.enable_diffusion_shared_vars_cache = (
+            self.configs.enable_diffusion_shared_vars_cache
+        )
+        self.enable_efficient_fusion = self.configs.enable_efficient_fusion
         self.N_cycle = self.configs.model.N_cycle
         self.N_model_seed = self.configs.model.N_model_seed
         self.train_confidence_only = configs.train_confidence_only
@@ -68,7 +117,10 @@ class Protenix(nn.Module):
         self.diffusion_batch_size = self.configs.diffusion_batch_size
 
         # Model
-        self.input_embedder = InputFeatureEmbedder(**configs.model.input_embedder)
+        esm_configs = configs.get("esm", {})  # This is used in InputFeatureEmbedder
+        self.input_embedder = InputFeatureEmbedder(
+            **configs.model.input_embedder, esm_configs=esm_configs
+        )
         self.relative_position_encoding = RelativePositionEncoding(
             **configs.model.relative_position_encoding
         )
@@ -76,6 +128,9 @@ class Protenix(nn.Module):
         self.msa_module = MSAModule(
             **configs.model.msa_module,
             msa_configs=configs.data.get("msa", {}),
+        )
+        self.constraint_embedder = ConstraintEmbedder(
+            **configs.model.constraint_embedder
         )
         self.pairformer_stack = PairformerStack(**configs.model.pairformer)
         self.diffusion_module = DiffusionModule(**configs.model.diffusion_module)
@@ -118,6 +173,8 @@ class Protenix(nn.Module):
         N_cycle: int,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        mc_dropout: bool = False,
+        mc_dropout_rate: float = 0.4,
     ) -> tuple[torch.Tensor, ...]:
         """
         The forward pass from the input to pairformer output
@@ -131,13 +188,6 @@ class Protenix(nn.Module):
         Returns:
             Tuple[torch.Tensor, ...]: s_inputs, s, z
         """
-        N_token = input_feature_dict["residue_index"].shape[-1]
-        if N_token <= 16:
-            # Deepspeed_evo_attention do not support token <= 16
-            deepspeed_evo_attention_condition_satisfy = False
-        else:
-            deepspeed_evo_attention_condition_satisfy = True
-
         if self.train_confidence_only:
             self.input_embedder.eval()
             self.template_embedder.eval()
@@ -148,21 +198,34 @@ class Protenix(nn.Module):
         s_inputs = self.input_embedder(
             input_feature_dict, inplace_safe=False, chunk_size=chunk_size
         )  # [..., N_token, 449]
-        s_init = self.linear_no_bias_sinit(s_inputs)  #  [..., N_token, c_s]
+        z_constraint = None
+
+        if "constraint_feature" in input_feature_dict:
+            z_constraint = self.constraint_embedder(
+                input_feature_dict["constraint_feature"]
+            )
+
+        s_init = self.linear_no_bias_sinit(s_inputs)  # [..., N_token, c_s]
         z_init = (
             self.linear_no_bias_zinit1(s_init)[..., None, :]
             + self.linear_no_bias_zinit2(s_init)[..., None, :, :]
-        )  #  [..., N_token, N_token, c_z]
+        )  # [..., N_token, N_token, c_z]
         if inplace_safe:
-            z_init += self.relative_position_encoding(input_feature_dict)
+            z_init += self.relative_position_encoding(input_feature_dict["relp"])
             z_init += self.linear_no_bias_token_bond(
                 input_feature_dict["token_bonds"].unsqueeze(dim=-1)
             )
+            if z_constraint is not None:
+                z_init += z_constraint
         else:
-            z_init = z_init + self.relative_position_encoding(input_feature_dict)
+            z_init = z_init + self.relative_position_encoding(
+                input_feature_dict["relp"]
+            )
             z_init = z_init + self.linear_no_bias_token_bond(
                 input_feature_dict["token_bonds"].unsqueeze(dim=-1)
             )
+            if z_constraint is not None:
+                z_init = z_init + z_constraint
         # Line 6
         z = torch.zeros_like(z_init)
         s = torch.zeros_like(s_init)
@@ -174,16 +237,20 @@ class Protenix(nn.Module):
                 and (not self.train_confidence_only)
                 and cycle_no == (N_cycle - 1)
             ):
-                z = z_init + self.linear_no_bias_z_cycle(self.layernorm_z_cycle(z))
+                if mc_dropout:
+                    z = z_init + F.dropout(
+                        self.linear_no_bias_z_cycle(self.layernorm_z_cycle(z)),
+                        p=self.configs.mc_dropout_rate,
+                    )
+                else:
+                    z = z_init + self.linear_no_bias_z_cycle(self.layernorm_z_cycle(z))
                 if inplace_safe:
                     if self.template_embedder.n_blocks > 0:
                         z += self.template_embedder(
                             input_feature_dict,
                             z,
-                            use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-                            use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-                            and deepspeed_evo_attention_condition_satisfy,
-                            use_lma=self.configs.use_lma,
+                            triangle_multiplicative=self.configs.triangle_multiplicative,
+                            triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,
                             chunk_size=chunk_size,
                         )
@@ -192,10 +259,8 @@ class Protenix(nn.Module):
                         z,
                         s_inputs,
                         pair_mask=None,
-                        use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-                        use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-                        and deepspeed_evo_attention_condition_satisfy,
-                        use_lma=self.configs.use_lma,
+                        triangle_multiplicative=self.configs.triangle_multiplicative,
+                        triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
                     )
@@ -204,10 +269,8 @@ class Protenix(nn.Module):
                         z = z + self.template_embedder(
                             input_feature_dict,
                             z,
-                            use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-                            use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-                            and deepspeed_evo_attention_condition_satisfy,
-                            use_lma=self.configs.use_lma,
+                            triangle_multiplicative=self.configs.triangle_multiplicative,
+                            triangle_attention=self.configs.triangle_attention,
                             inplace_safe=inplace_safe,
                             chunk_size=chunk_size,
                         )
@@ -216,10 +279,8 @@ class Protenix(nn.Module):
                         z,
                         s_inputs,
                         pair_mask=None,
-                        use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-                        use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-                        and deepspeed_evo_attention_condition_satisfy,
-                        use_lma=self.configs.use_lma,
+                        triangle_multiplicative=self.configs.triangle_multiplicative,
+                        triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
                     )
@@ -228,10 +289,8 @@ class Protenix(nn.Module):
                     s,
                     z,
                     pair_mask=None,
-                    use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-                    use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-                    and deepspeed_evo_attention_condition_satisfy,
-                    use_lma=self.configs.use_lma,
+                    triangle_multiplicative=self.configs.triangle_multiplicative,
+                    triangle_attention=self.configs.triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                 )
@@ -244,7 +303,7 @@ class Protenix(nn.Module):
 
         return s_inputs, s, z
 
-    def sample_diffusion(self, **kwargs) -> torch.Tensor:
+    def sample_diffusion(self, **kwargs: Any) -> torch.Tensor:
         """
         Samples diffusion process based on the provided configurations.
 
@@ -276,7 +335,7 @@ class Protenix(nn.Module):
             sample_diffusion
         )(**_configs, **kwargs)
 
-    def run_confidence_head(self, *args, **kwargs):
+    def run_confidence_head(self, *args: Any, **kwargs: Any) -> Any:
         """
         Runs the confidence head with optional automatic mixed precision (AMP) disabled.
 
@@ -297,6 +356,7 @@ class Protenix(nn.Module):
         chunk_size: Optional[int] = 4,
         N_model_seed: int = 1,
         symmetric_permutation: SymmetricPermutation = None,
+        mc_dropout_apply_rate: float = 0.4,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (multiple model seeds) for the Alphafold3 model.
@@ -310,15 +370,59 @@ class Protenix(nn.Module):
             chunk_size (Optional[int]): Chunk size for memory-efficient operations. Defaults to 4.
             N_model_seed (int): Number of model seeds. Defaults to 1.
             symmetric_permutation (SymmetricPermutation): Symmetric permutation object. Defaults to None.
+            mc_dropout_apply_rate (float): Only for inference mode
 
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
         """
-        pred_dicts = []
-        log_dicts = []
-        time_trackers = []
-        for _ in range(N_model_seed):
-            pred_dict, log_dict, time_tracker = self._main_inference_loop(
+        # For backward compatibility, if N_model_seed > 1, process multiple seeds here
+        # But in evaluation mode, this should be handled externally
+        if N_model_seed > 1 and mode in ["inference"]:
+            pred_dicts = []
+            log_dicts = []
+            time_trackers = []
+            for _ in range(N_model_seed):
+                pred_dict, log_dict, time_tracker = self._main_inference_loop(
+                    input_feature_dict=(
+                        copy.deepcopy(input_feature_dict)
+                        if (N_model_seed > 1 and mode == "inference")
+                        else input_feature_dict
+                    ),  # the input_feature_dict is modified when mode is "inference"
+                    label_dict=label_dict,
+                    N_cycle=N_cycle,
+                    mode=mode,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                    symmetric_permutation=symmetric_permutation,
+                    mc_dropout=random.random() < mc_dropout_apply_rate,
+                )
+                pred_dicts.append(pred_dict)
+                log_dicts.append(log_dict)
+                time_trackers.append(time_tracker)
+
+            # Combine outputs of multiple models
+            def _cat(dict_list, key):
+                return torch.cat([x[key] for x in dict_list], dim=0)
+
+            def _list_join(dict_list, key):
+                return sum([x[key] for x in dict_list], [])
+
+            all_pred_dict = {
+                "coordinate": _cat(pred_dicts, "coordinate"),
+                "summary_confidence": _list_join(pred_dicts, "summary_confidence"),
+                "full_data": _list_join(pred_dicts, "full_data"),
+                "plddt": _cat(pred_dicts, "plddt"),
+                "pae": _cat(pred_dicts, "pae"),
+                "pde": _cat(pred_dicts, "pde"),
+                "resolved": _cat(pred_dicts, "resolved"),
+            }
+
+            all_log_dict = simple_merge_dict_list(log_dicts)
+            all_time_dict = simple_merge_dict_list(time_trackers)
+            return all_pred_dict, all_log_dict, all_time_dict
+        else:
+            # Single seed inference - delegate to _main_inference_loop
+            return self._main_inference_loop(
                 input_feature_dict=input_feature_dict,
                 label_dict=label_dict,
                 N_cycle=N_cycle,
@@ -326,31 +430,35 @@ class Protenix(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 symmetric_permutation=symmetric_permutation,
+                mc_dropout=random.random() < mc_dropout_apply_rate,
             )
-            pred_dicts.append(pred_dict)
-            log_dicts.append(log_dict)
-            time_trackers.append(time_tracker)
 
-        # Combine outputs of multiple models
-        def _cat(dict_list, key):
-            return torch.cat([x[key] for x in dict_list], dim=0)
+    def _get_dynamic_chunk_size(self, N_token: int) -> Optional[int]:
+        """
+        Get dynamic chunk_size based on token count
 
-        def _list_join(dict_list, key):
-            return sum([x[key] for x in dict_list], [])
+        Args:
+            N_token (int): Number of tokens
 
-        all_pred_dict = {
-            "coordinate": _cat(pred_dicts, "coordinate"),
-            "summary_confidence": _list_join(pred_dicts, "summary_confidence"),
-            "full_data": _list_join(pred_dicts, "full_data"),
-            "plddt": _cat(pred_dicts, "plddt"),
-            "pae": _cat(pred_dicts, "pae"),
-            "pde": _cat(pred_dicts, "pde"),
-            "resolved": _cat(pred_dicts, "resolved"),
-        }
+        Returns:
+            Optional[int]: Optimal chunk_size for the given token count
+        """
+        if not hasattr(self.configs.infer_setting, "chunk_size_thresholds"):
+            return self.configs.infer_setting.chunk_size
 
-        all_log_dict = simple_merge_dict_list(log_dicts)
-        all_time_dict = simple_merge_dict_list(time_trackers)
-        return all_pred_dict, all_log_dict, all_time_dict
+        thresholds = self.configs.infer_setting.chunk_size_thresholds
+
+        # Convert string keys to integers and sort in ascending order
+        threshold_pairs = [(int(k), v) for k, v in thresholds.items()]
+        sorted_thresholds = sorted(threshold_pairs, key=lambda x: x[0])
+
+        # Find the appropriate chunk_size for the given token count
+        for threshold, chunk_size in sorted_thresholds:
+            if N_token <= threshold:
+                return None if chunk_size == -1 else chunk_size
+
+        # For token counts larger than the largest threshold, use smallest chunk_size
+        return 32  # extreme case for very large proteins
 
     def _main_inference_loop(
         self,
@@ -361,19 +469,25 @@ class Protenix(nn.Module):
         inplace_safe: bool = True,
         chunk_size: Optional[int] = 4,
         symmetric_permutation: SymmetricPermutation = None,
+        mc_dropout: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (single model seed) for the Alphafold3 model.
+        mc_dropout: do not use by default
 
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
         """
         step_st = time.time()
         N_token = input_feature_dict["residue_index"].shape[-1]
-        if N_token <= 16:
-            deepspeed_evo_attention_condition_satisfy = False
-        else:
-            deepspeed_evo_attention_condition_satisfy = True
+
+        # Apply dynamic chunk_size if enabled (otherwise keep the passed chunk_size)
+        if (
+            hasattr(self.configs.infer_setting, "dynamic_chunk_size")
+            and self.configs.infer_setting.dynamic_chunk_size
+        ):
+            chunk_size = self._get_dynamic_chunk_size(N_token)
+        # If dynamic chunking is disabled, chunk_size keeps its original value from the function parameter
 
         log_dict = {}
         pred_dict = {}
@@ -384,23 +498,23 @@ class Protenix(nn.Module):
             N_cycle=N_cycle,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
+            mc_dropout=mc_dropout,
         )
-        if mode == "inference":
-            keys_to_delete = []
-            for key in input_feature_dict.keys():
-                if "template_" in key or key in [
-                    "msa",
-                    "has_deletion",
-                    "deletion_value",
-                    "profile",
-                    "deletion_mean",
-                    "token_bonds",
-                ]:
-                    keys_to_delete.append(key)
 
-            for key in keys_to_delete:
-                del input_feature_dict[key]
-            torch.cuda.empty_cache()
+        keys_to_delete = []
+        for key in input_feature_dict.keys():
+            if "template_" in key or key in [
+                "msa",
+                "has_deletion",
+                "deletion_value",
+                "profile",
+                "deletion_mean",
+                # "token_bonds",
+            ]:
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del input_feature_dict[key]
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
         # Sample diffusion
@@ -411,23 +525,54 @@ class Protenix(nn.Module):
         noise_schedule = self.inference_noise_scheduler(
             N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
         )
+        cache = dict()
+        if self.enable_diffusion_shared_vars_cache:
+            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
+            cache["pair_z"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+                input_feature_dict["relp"], z, False
+            )
+            cache["p_lm/c_l"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+                ref_pos=input_feature_dict["ref_pos"],
+                ref_charge=input_feature_dict["ref_charge"],
+                ref_mask=input_feature_dict["ref_mask"],
+                ref_element=input_feature_dict["ref_element"],
+                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                d_lm=input_feature_dict["d_lm"],
+                v_lm=input_feature_dict["v_lm"],
+                pad_info=input_feature_dict["pad_info"],
+                r_l=True,
+                z=cache["pair_z"],
+                inplace_safe=False,
+            )
+        else:
+            cache["pair_z"] = None
+            cache["p_lm/c_l"] = [None, None]
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
             s_trunk=s,
-            z_trunk=z,
+            z_trunk=None if cache["pair_z"] is not None else z,
+            pair_z=cache["pair_z"],
+            p_lm=cache["p_lm/c_l"][0],
+            c_l=cache["p_lm/c_l"][1],
             N_sample=N_sample,
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
+            enable_efficient_fusion=self.enable_efficient_fusion,
         )
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
-        if mode == "inference" and N_token > 2000:
-            torch.cuda.empty_cache()
         # Distogram logits: log contact_probs only, to reduce the dimension
-        pred_dict["contact_probs"] = sample_confidence.compute_contact_prob(
+        pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
+            sample_confidence.compute_contact_prob
+        )(
             distogram_logits=self.distogram_head(z),
             **sample_confidence.get_bin_params(self.configs.loss.distogram),
         )  # [N_token, N_token]
@@ -445,10 +590,8 @@ class Protenix(nn.Module):
             z_trunk=z,
             pair_mask=None,
             x_pred_coords=pred_dict["coordinate"],
-            use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-            use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-            and deepspeed_evo_attention_condition_satisfy,
-            use_lma=self.configs.use_lma,
+            triangle_multiplicative=self.configs.triangle_multiplicative,
+            triangle_attention=self.configs.triangle_attention,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
@@ -475,28 +618,31 @@ class Protenix(nn.Module):
             interested_atom_mask = None
         else:
             interested_atom_mask = label_dict.get("interested_ligand_mask", None)
-        pred_dict["summary_confidence"], pred_dict["full_data"] = (
-            sample_confidence.compute_full_data_and_summary(
-                configs=self.configs,
-                pae_logits=pred_dict["pae"],
-                plddt_logits=pred_dict["plddt"],
-                pde_logits=pred_dict["pde"],
-                contact_probs=pred_dict.get(
-                    "per_sample_contact_probs", pred_dict["contact_probs"]
-                ),
-                token_asym_id=input_feature_dict["asym_id"],
-                token_has_frame=input_feature_dict["has_frame"],
-                atom_coordinate=pred_dict["coordinate"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                atom_is_polymer=1 - input_feature_dict["is_ligand"],
-                N_recycle=N_cycle,
-                interested_atom_mask=interested_atom_mask,
-                return_full_data=True,
-                mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
-                elements_one_hot=(
-                    input_feature_dict["ref_element"] if mode != "inference" else None
-                ),
-            )
+        (
+            pred_dict["summary_confidence"],
+            pred_dict["full_data"],
+        ) = autocasting_disable_decorator(True)(
+            sample_confidence.compute_full_data_and_summary
+        )(
+            configs=self.configs,
+            pae_logits=pred_dict["pae"],
+            plddt_logits=pred_dict["plddt"],
+            pde_logits=pred_dict["pde"],
+            contact_probs=pred_dict.get(
+                "per_sample_contact_probs", pred_dict["contact_probs"]
+            ),
+            token_asym_id=input_feature_dict["asym_id"],
+            token_has_frame=input_feature_dict["has_frame"],
+            atom_coordinate=pred_dict["coordinate"],
+            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            atom_is_polymer=1 - input_feature_dict["is_ligand"],
+            N_recycle=N_cycle,
+            interested_atom_mask=interested_atom_mask,
+            return_full_data=True,
+            mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
+            elements_one_hot=(
+                input_feature_dict["ref_element"] if mode != "inference" else None
+            ),
         )
 
         return pred_dict, log_dict, time_tracker
@@ -505,7 +651,7 @@ class Protenix(nn.Module):
         self,
         input_feature_dict: dict[str, Any],
         label_full_dict: dict[str, Any],
-        label_dict: dict,
+        label_dict: dict[str, Any],
         N_cycle: int,
         symmetric_permutation: SymmetricPermutation,
         inplace_safe: bool = False,
@@ -527,11 +673,6 @@ class Protenix(nn.Module):
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
                 Prediction, updated label, and log dictionaries.
         """
-        N_token = input_feature_dict["residue_index"].shape[-1]
-        if N_token <= 16:
-            deepspeed_evo_attention_condition_satisfy = False
-        else:
-            deepspeed_evo_attention_condition_satisfy = True
 
         s_inputs, s, z = self.get_pairformer_output(
             input_feature_dict=input_feature_dict,
@@ -543,6 +684,32 @@ class Protenix(nn.Module):
         log_dict = {}
         pred_dict = {}
 
+        cache = dict()
+        if self.enable_diffusion_shared_vars_cache:
+            cache["pair_z"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+                input_feature_dict["relp"], z, False
+            )
+            cache["p_lm/c_l"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+                ref_pos=input_feature_dict["ref_pos"],
+                ref_charge=input_feature_dict["ref_charge"],
+                ref_mask=input_feature_dict["ref_mask"],
+                ref_element=input_feature_dict["ref_element"],
+                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                d_lm=input_feature_dict["d_lm"],
+                v_lm=input_feature_dict["v_lm"],
+                pad_info=input_feature_dict["pad_info"],
+                r_l=True,
+                z=cache["pair_z"],
+                inplace_safe=False,
+            )
+        else:
+            cache["pair_z"] = None
+            cache["p_lm/c_l"] = [None, None]
         # Mini-rollout: used for confidence and label permutation
         with torch.no_grad():
             # [..., 1, N_atom, 3]
@@ -550,35 +717,52 @@ class Protenix(nn.Module):
                 "N_sample_mini_rollout"
             ]  # =1
             N_step_mini_rollout = self.configs.sample_diffusion["N_step_mini_rollout"]
-
+            self.diffusion_module.eval()  # use eval mode for mini-rollout
             coordinate_mini = self.sample_diffusion(
                 denoise_net=self.diffusion_module,
                 input_feature_dict=input_feature_dict,
                 s_inputs=s_inputs.detach(),
                 s_trunk=s.detach(),
-                z_trunk=z.detach(),
+                z_trunk=None if cache["pair_z"] is not None else z.detach(),
+                pair_z=None if cache["pair_z"] is None else cache["pair_z"].detach(),
+                p_lm=(
+                    None
+                    if cache["p_lm/c_l"][0] is None
+                    else cache["p_lm/c_l"][0].detach()
+                ),
+                c_l=(
+                    None
+                    if cache["p_lm/c_l"][1] is None
+                    else cache["p_lm/c_l"][1].detach()
+                ),
                 N_sample=N_sample_mini_rollout,
                 noise_schedule=self.inference_noise_scheduler(
                     N_step=N_step_mini_rollout,
                     device=s_inputs.device,
                     dtype=s_inputs.dtype,
                 ),
+                enable_efficient_fusion=self.enable_efficient_fusion,
             )
+            self.diffusion_module.train()
             coordinate_mini.detach_()
             pred_dict["coordinate_mini"] = coordinate_mini
 
             # Permute ground truth to match mini-rollout prediction
-            label_dict, perm_log_dict = (
-                symmetric_permutation.permute_label_to_match_mini_rollout(
-                    coordinate_mini,
-                    input_feature_dict,
-                    label_dict,
-                    label_full_dict,
-                )
+            (
+                label_dict,
+                perm_log_dict,
+            ) = symmetric_permutation.permute_label_to_match_mini_rollout(
+                coordinate_mini,
+                input_feature_dict,
+                label_dict,
+                label_full_dict,
             )
             log_dict.update(perm_log_dict)
 
         # Confidence: use mini-rollout prediction, and detach token embeddings
+        drop_embedding = (
+            random.random() < self.configs.model.confidence_embedding_drop_rate
+        )
         plddt_pred, pae_pred, pde_pred, resolved_pred = self.run_confidence_head(
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
@@ -586,10 +770,9 @@ class Protenix(nn.Module):
             z_trunk=z,
             pair_mask=None,
             x_pred_coords=coordinate_mini,
-            use_memory_efficient_kernel=self.configs.use_memory_efficient_kernel,
-            use_deepspeed_evo_attention=self.configs.use_deepspeed_evo_attention
-            and deepspeed_evo_attention_condition_satisfy,
-            use_lma=self.configs.use_lma,
+            use_embedding=not drop_embedding,
+            triangle_multiplicative=self.configs.triangle_multiplicative,
+            triangle_attention=self.configs.triangle_attention,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
@@ -610,6 +793,9 @@ class Protenix(nn.Module):
         # x_denoised: [..., N_sample, N_atom, 3]
         # x_noise_level: [..., N_sample]
         N_sample = self.diffusion_batch_size
+        drop_conditioning = (
+            random.random() < self.configs.model.condition_embedding_drop_rate
+        )
         _, x_denoised, x_noise_level = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
@@ -619,13 +805,20 @@ class Protenix(nn.Module):
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
             s_trunk=s,
-            z_trunk=z,
+            z_trunk=None if cache["pair_z"] is not None else z,
+            pair_z=cache["pair_z"],
+            p_lm=cache["p_lm/c_l"][0],
+            c_l=cache["p_lm/c_l"][1],
             N_sample=N_sample,
             diffusion_chunk_size=self.configs.diffusion_chunk_size,
+            use_conditioning=not drop_conditioning,
+            enable_efficient_fusion=self.enable_efficient_fusion,
         )
         pred_dict.update(
             {
-                "distogram": self.distogram_head(z),
+                "distogram": autocasting_disable_decorator(True)(self.distogram_head)(
+                    z
+                ),
                 # [..., N_sample=48, N_atom, 3]: diffusion loss
                 "coordinate": x_denoised,
                 "noise_level": x_noise_level,
@@ -634,12 +827,16 @@ class Protenix(nn.Module):
 
         # Permute symmetric atom/chain in each sample to match true structure
         # Note: currently chains cannot be permuted since label is cropped
-        pred_dict, perm_log_dict, _, _ = (
-            symmetric_permutation.permute_diffusion_sample_to_match_label(
-                input_feature_dict, pred_dict, label_dict, stage="train"
-            )
+        (
+            pred_dict,
+            perm_log_dict,
+            _,
+            _,
+        ) = symmetric_permutation.permute_diffusion_sample_to_match_label(
+            input_feature_dict, pred_dict, label_dict, stage="train"
         )
         log_dict.update(perm_log_dict)
+        log_dict.update({"noise_level": x_noise_level})
 
         return pred_dict, label_dict, log_dict
 
@@ -651,6 +848,8 @@ class Protenix(nn.Module):
         mode: str = "inference",
         current_step: Optional[int] = None,
         symmetric_permutation: SymmetricPermutation = None,
+        disable_inplace: bool = False,
+        mc_dropout_apply_rate: float = 0.4,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -668,9 +867,14 @@ class Protenix(nn.Module):
                 Prediction, updated label, and log dictionaries.
         """
 
-        assert mode in ["train", "inference", "eval"]
-        inplace_safe = not (self.training or torch.is_grad_enabled())
-        chunk_size = self.configs.infer_setting.chunk_size if inplace_safe else None
+        assert mode in ["train", "eval", "inference"]
+        not_use_gradient = not (self.training or torch.is_grad_enabled())
+        inplace_safe = not_use_gradient and (not disable_inplace)
+
+        input_feature_dict = self.relative_position_encoding.generate_relp(
+            input_feature_dict
+        )
+        input_feature_dict = update_input_feature_dict(input_feature_dict)
 
         if mode == "train":
             nc_rng = np.random.RandomState(current_step)
@@ -686,8 +890,9 @@ class Protenix(nn.Module):
                 N_cycle=N_cycle,
                 symmetric_permutation=symmetric_permutation,
                 inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
+                chunk_size=None,
             )
+            log_dict["N_cycle"] = N_cycle
         elif mode == "inference":
             pred_dict, log_dict, time_tracker = self.main_inference_loop(
                 input_feature_dict=input_feature_dict,
@@ -695,9 +900,10 @@ class Protenix(nn.Module):
                 N_cycle=self.N_cycle,
                 mode=mode,
                 inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
+                chunk_size=self.configs.infer_setting.chunk_size,
                 N_model_seed=self.N_model_seed,
                 symmetric_permutation=None,
+                mc_dropout_apply_rate=mc_dropout_apply_rate,
             )
             log_dict.update({"time": time_tracker})
         elif mode == "eval":
@@ -714,9 +920,10 @@ class Protenix(nn.Module):
                 N_cycle=self.N_cycle,
                 mode=mode,
                 inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-                N_model_seed=self.N_model_seed,
+                chunk_size=self.configs.infer_setting.chunk_size,
+                N_model_seed=1,
                 symmetric_permutation=symmetric_permutation,
+                mc_dropout_apply_rate=mc_dropout_apply_rate,
             )
             log_dict.update({"time": time_tracker})
 

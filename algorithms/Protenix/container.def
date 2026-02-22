@@ -1,6 +1,5 @@
 Bootstrap: docker
-From: ai4s-cn-beijing.cr.volces.com/pytorch-mirror/pytorch:2.3.1-cuda12.1-cudnn8-devel
-
+From: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 
 %environment
     # Define system variables to provide GPU access within the container.
@@ -8,6 +7,7 @@ From: ai4s-cn-beijing.cr.volces.com/pytorch-mirror/pytorch:2.3.1-cuda12.1-cudnn8
 
     # Define python path
     export PYTHON=/opt/conda/bin/python
+    export CUTLASS_PATH=/opt/cutlass
 
 %files
     # Copy algorithm-related files to a separate dir /algo.
@@ -16,23 +16,21 @@ From: ai4s-cn-beijing.cr.volces.com/pytorch-mirror/pytorch:2.3.1-cuda12.1-cudnn8
     algorithms/base /algo/base
 
 %post
-    # Download algorithm source code
-    cd /algo
+    set -e
 
-    # from github
-    # git clone https://github.com/bytedance/Protenix.git
-    # cd ./Protenix
-    # pip install -e .
+    # System deps needed by Protenix preprocessing/inference paths
+    apt-get update && \
+      apt-get install -y --no-install-recommends \
+        git g++ gcc libc6-dev make hmmer kalign && \
+      apt-get clean && rm -rf /var/lib/apt/lists/*
 
-    # from local source code
-    cd ./Protenix
-    # pip install -e . 
-    pip install -e .
-    
-    # from pip
-    # pip install protenix
+    # CUTLASS for kernels
+    git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git /opt/cutlass || true
 
-%post
+    # Install algorithm source code and deps
+    cd /algo/Protenix
+    /opt/conda/bin/pip install -e .
+
     # Make sure make_predictions.sh file is executable.
     chmod +x /algo/make_predictions.sh
 

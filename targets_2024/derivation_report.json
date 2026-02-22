@@ -1,0 +1,71 @@
+{
+  "generated_at": "2026-02-20T10:13:30.624967Z",
+  "cutoff_date": "2024-01-01",
+  "targets_dir": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/targets",
+  "out_dir": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/targets_2024",
+  "cache_path": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/targets_2024/release_date_cache.json",
+  "target_files": 9,
+  "unique_entry_ids": 1522,
+  "enrichment_stats": {
+    "api_calls": 1522,
+    "cache_hits": 0,
+    "resolved": 1519,
+    "failed": 3
+  },
+  "unresolved_count": 3,
+  "unresolved_examples": [
+    {
+      "entry_id": "8C0H",
+      "status": "not_found",
+      "detail": null
+    },
+    {
+      "entry_id": "8PNI",
+      "status": "not_found",
+      "detail": null
+    },
+    {
+      "entry_id": "8XNH",
+      "status": "not_found",
+      "detail": null
+    }
+  ],
+  "per_file_counts": {
+    "interface_antibody_antigen.csv": {
+      "original_rows": 172,
+      "kept_rows": 74
+    },
+    "interface_protein_dna.csv": {
+      "original_rows": 330,
+      "kept_rows": 181
+    },
+    "interface_protein_ligand.csv": {
+      "original_rows": 558,
+      "kept_rows": 220
+    },
+    "interface_protein_peptide.csv": {
+      "original_rows": 51,
+      "kept_rows": 30
+    },
+    "interface_protein_protein.csv": {
+      "original_rows": 279,
+      "kept_rows": 131
+    },
+    "interface_protein_rna.csv": {
+      "original_rows": 70,
+      "kept_rows": 41
+    },
+    "monomer_dna.csv": {
+      "original_rows": 14,
+      "kept_rows": 4
+    },
+    "monomer_protein.csv": {
+      "original_rows": 334,
+      "kept_rows": 159
+    },
+    "monomer_rna.csv": {
+      "original_rows": 15,
+      "kept_rows": 8
+    }
+  }
+}

@@ -70,22 +70,49 @@ def get_adamw(
     return optimizer
 
 
-def get_optimizer(configs, model: torch.nn.Module) -> torch.optim.Optimizer:
+def get_optimizer(
+    configs, model: torch.nn.Module, param_names=None
+) -> torch.optim.Optimizer:
+    print("param_names: ", param_names)
+    if len(param_names) == 0 or param_names[0] == "":
+        param_names = None
     if configs.adam.use_adamw:
         optimizer = get_adamw(
             model=model,
             weight_decay=configs.adam.weight_decay,
             learning_rate=configs.adam.lr,
+            other_learning_rate=configs.other_lr,
             betas=(configs.adam.beta1, configs.adam.beta2),
             device_type="cuda" if torch.cuda.is_available() else "cpu",
         )
     else:
+        if param_names is None or len(param_names) == 0:
+            param_groups = [{"params": model.parameters(), "lr": configs.lr}]
+        else:
+            finetune_params = []
+            finetune_params_names = []
+            other_params = []
+            for n, p in model.named_parameters():
+                if any([name in n for name in param_names]):
+                    finetune_params.append(p)
+                    finetune_params_names.append(n)
+                else:
+                    other_params.append(p)
+            param_groups = [{"params": finetune_params, "lr": configs.finetune.lr}]
+            print("Sample Finetune Params Names: ", finetune_params_names[:5])
+            if configs.lr > 0.0:
+                param_groups.append({"params": other_params, "lr": configs.lr})
+
         optimizer = torch.optim.Adam(
-            model.parameters(),
+            param_groups,
             lr=configs.adam.lr,
             weight_decay=configs.adam.weight_decay,
             betas=(configs.adam.beta1, configs.adam.beta2),
         )
+        for i, param_group in enumerate(optimizer.param_groups):
+            print(
+                f"Parameter Group {i}: Learning Rate = {param_group['lr']} Num = {len(param_group['params'])}"
+            )
     return optimizer
 
 

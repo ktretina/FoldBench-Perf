@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -23,55 +23,63 @@ from protenix.model.modules.primitives import (
     AdaptiveLayerNorm,
     Attention,
     BiasInitLinear,
-    LinearNoBias,
     broadcast_token_to_local_atom_pair,
+    DropPath,
+    LinearNoBias,
     rearrange_qk_to_dense_trunk,
 )
+from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import (
     aggregate_atom_to_token,
     broadcast_token_to_atom,
+    checkpoint_blocks,
     permute_final_dims,
 )
-from protenix.openfold_local.model.primitives import LayerNorm
-from protenix.openfold_local.utils.checkpointing import checkpoint_blocks
 
 
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
+
+    Args:
+        has_s (bool, optional):  whether s is None as stated in Algorithm 24 Line1. Defaults to True.
+        create_offset_ln_z (bool, optional): the value of create_offset for the LayerNorm applied to z. Defaults to False.
+        n_heads (int, optional): number of attention-like head in AttentionPairBias. Defaults to 16.
+        c_a (int, optional): the embedding dim of a(single feature aggregated atom info). Defaults to 768.
+        c_s (int, optional):  hidden dim [for single embedding]. Defaults to 384.
+        c_z (int, optional): hidden dim [for pair embedding]. Defaults to 128.
+        biasinit (float, optional): biasinit for BiasInitLinear. Defaults to -2.0.
+        cross_attention_mode (bool, optional): If cross_attention_model = True, the adaptive layernorm will be applied
+            to query and key/value seperately. Defaults to False.
     """
 
     def __init__(
         self,
         has_s: bool = True,
+        create_offset_ln_z: bool = False,
         n_heads: int = 16,
         c_a: int = 768,
         c_s: int = 384,
         c_z: int = 128,
         biasinit: float = -2.0,
+        cross_attention_mode: bool = False,
     ) -> None:
-        """
-        Args:
-            has_s (bool, optional):  whether s is None as stated in Algorithm 24 Line1. Defaults to True.
-            n_heads (int, optional): number of attention-like head in AttentionPairBias. Defaults to 16.
-            c_a (int, optional): the embedding dim of a(single feature aggregated atom info). Defaults to 768.
-            c_s (int, optional):  hidden dim [for single embedding]. Defaults to 384.
-            c_z (int, optional): hidden dim [for pair embedding]. Defaults to 128.
-            biasinit (float, optional): biasinit for BiasInitLinear. Defaults to -2.0.
-        """
         super(AttentionPairBias, self).__init__()
         assert c_a % n_heads == 0
         self.n_heads = n_heads
         self.has_s = has_s
+        self.create_offset_ln_z = create_offset_ln_z
+        self.cross_attention_mode = cross_attention_mode
         if has_s:
             # Line2
             self.layernorm_a = AdaptiveLayerNorm(c_a=c_a, c_s=c_s)
-            # Line 13
-            self.linear_a_last = BiasInitLinear(
-                in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
-            )
+            if self.cross_attention_mode:
+                self.layernorm_kv = AdaptiveLayerNorm(c_a=c_a, c_s=c_s)
         else:
             self.layernorm_a = LayerNorm(c_a)
+            if self.cross_attention_mode:
+                self.layernorm_kv = LayerNorm(c_a)
+
         # Line 6-11
         self.local_attention_method = "local_cross_attention"
         self.attention = Attention(
@@ -83,21 +91,22 @@ class AttentionPairBias(nn.Module):
             gating=True,
             q_linear_bias=True,
             local_attention_method=self.local_attention_method,
+            zero_init=not self.has_s,  # Adaptive zero init
         )
-        self.layernorm_z = LayerNorm(c_z)
+        self.layernorm_z = LayerNorm(c_z, create_offset=self.create_offset_ln_z)
         # Alg24. Line8 is scalar, but this is different for different heads
         self.linear_nobias_z = LinearNoBias(in_features=c_z, out_features=n_heads)
 
-    def glorot_init(self):
-        nn.init.xavier_uniform_(self.attention.linear_q.weight)
-        nn.init.xavier_uniform_(self.attention.linear_k.weight)
-        nn.init.xavier_uniform_(self.attention.linear_v.weight)
-        nn.init.zeros_(self.attention.linear_q.bias)
+        # Line 13
+        if self.has_s:
+            self.linear_a_last = BiasInitLinear(
+                in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
+            )
 
     def local_multihead_attention(
         self,
-        a: torch.Tensor,
-        s: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
         z: torch.Tensor,
         n_queries: int = 32,
         n_keys: int = 128,
@@ -107,10 +116,10 @@ class AttentionPairBias(nn.Module):
         """Used by Algorithm 24, with beta_ij being the local mask. Used in AtomTransformer.
 
         Args:
-            a (torch.Tensor): atom embedding
+            q (torch.Tensor): query embedding
                 [..., N_atom, c_a]
-            s (torch.Tensor): atom embedding
-                [..., N_atom, c_s]
+            kv (torch.Tensor): key/value embedding
+                [..., N_atom, c_a]
             z (torch.Tensor): atom-atom pair embedding, in trunked dense shape. Used for computing pair bias.
                 [..., n_blocks, n_queries, n_keys, c_z]
             n_queries (int, optional): local window size of query tensor. Defaults to 32.
@@ -125,7 +134,7 @@ class AttentionPairBias(nn.Module):
 
         assert n_queries == z.size(-3)
         assert n_keys == z.size(-2)
-        assert len(z.shape) == len(a.shape) + 2
+        assert len(z.shape) == len(q.shape) + 2
 
         # Multi-head attention bias
         bias = self.linear_nobias_z(
@@ -136,34 +145,36 @@ class AttentionPairBias(nn.Module):
         )  # [..., n_heads, n_blocks, n_queries, n_keys]
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
-        a = self.attention(
-            q_x=a,
-            kv_x=a,
+        q = self.attention(
+            q_x=q,
+            kv_x=kv,
             trunked_attn_bias=bias,
             n_queries=n_queries,
             n_keys=n_keys,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
-        return a
+        return q
 
     def standard_multihead_attention(
         self,
-        a: torch.Tensor,
-        s: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
         z: torch.Tensor,
         inplace_safe: bool = False,
+        enable_efficient_fusion: bool = False,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
 
         Args:
-            a (torch.Tensor): the single feature aggregate per-atom representation
+            q (torch.Tensor): the query embedding
                 [..., N_token, c_a]
-            s (torch.Tensor): single embedding
-                [..., N_token, c_s]
+            kv (torch.Tensor): the key/value embedding
+                [..., N_token, c_a]
             z (torch.Tensor): pair embedding, used for computing pair bias.
                 [..., N_token, N_token, c_z]
             inplace_safe (bool): Whether it is safe to use inplace operations. Defaults to False.
+            enable_efficient_fusion (bool): Whether to enable efficient fusion of bias calculation in attention to speed up. Defaults to False. (Alg 24)
 
         Returns:
             torch.Tensor: the updated a from AttentionPairBias
@@ -171,13 +182,21 @@ class AttentionPairBias(nn.Module):
         """
 
         # Multi-head attention bias
-        bias = self.linear_nobias_z(self.layernorm_z(z))
-        bias = permute_final_dims(bias, [2, 0, 1])  # [..., n_heads, N_token, N_token]
+        if enable_efficient_fusion:
+            weight = (self.linear_nobias_z.weight * self.layernorm_z.weight[None, :])[
+                :, :, None, None
+            ]
+            bias = F.conv2d(z, weight)
+        else:
+            bias = self.linear_nobias_z(self.layernorm_z(z))
+            bias = permute_final_dims(
+                bias, [2, 0, 1]
+            )  # [..., n_heads, N_token, N_token]
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
-        a = self.attention(q_x=a, kv_x=a, attn_bias=bias, inplace_safe=inplace_safe)
+        q = self.attention(q_x=q, kv_x=kv, attn_bias=bias, inplace_safe=inplace_safe)
 
-        return a
+        return q
 
     def forward(
         self,
@@ -188,6 +207,7 @@ class AttentionPairBias(nn.Module):
         n_keys: Optional[int] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        enable_efficient_fusion: bool = False,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -196,11 +216,19 @@ class AttentionPairBias(nn.Module):
         else:
             a = self.layernorm_a(a)
 
+        if self.cross_attention_mode:
+            if self.has_s:
+                kv = self.layernorm_kv(a=a, s=s)
+            else:
+                kv = self.layernorm_kv(a)
+        else:
+            kv = None
+
         # Multihead attention with pair bias
         if n_queries and n_keys:
             a = self.local_multihead_attention(
                 a,
-                s,
+                kv if self.cross_attention_mode else a,
                 z,
                 n_queries,
                 n_keys,
@@ -208,7 +236,13 @@ class AttentionPairBias(nn.Module):
                 chunk_size=chunk_size,
             )
         else:
-            a = self.standard_multihead_attention(a, s, z, inplace_safe=inplace_safe)
+            a = self.standard_multihead_attention(
+                a,
+                kv if self.cross_attention_mode else a,
+                z,
+                inplace_safe=inplace_safe,
+                enable_efficient_fusion=enable_efficient_fusion,
+            )
 
         # Output projection (from adaLN-Zero [27])
         if self.has_s:
@@ -223,6 +257,15 @@ class AttentionPairBias(nn.Module):
 class DiffusionTransformerBlock(nn.Module):
     """
     Implements Algorithm 23[Line2-Line3] in AF3
+
+    Args:
+        c_a (int): single embedding dimension.
+        c_s (int): single embedding dimension.
+        c_z (int): pair embedding dimension.
+        n_heads (int): number of heads for DiffusionTransformerBlock.
+        biasinit (float, optional): bias initialization value. Defaults to -2.0.
+        drop_path_rate (float, optional): drop path rate. Defaults to 0.0.
+        cross_attention_mode (bool, optional): whether to use cross attention. Defaults to False.
     """
 
     def __init__(
@@ -232,24 +275,29 @@ class DiffusionTransformerBlock(nn.Module):
         c_z: int,  # could be c_z or c_atompair
         n_heads: int,  # could be 16 or 4 or ... in AF3
         biasinit: float = -2.0,
+        drop_path_rate: float = 0.0,
+        cross_attention_mode: bool = False,
     ) -> None:
-        """
-        Args:
-            c_a (int, optional): single embedding dimension.
-            c_s (int, optional): single embedding dimension.
-            c_z (int, optional): pair embedding dimension.
-            n_heads (int, optional): number of heads for DiffusionTransformerBlock.
-        """
         super(DiffusionTransformerBlock, self).__init__()
         self.n_heads = n_heads
         self.c_a = c_a
         self.c_s = c_s
         self.c_z = c_z
         self.attention_pair_bias = AttentionPairBias(
-            has_s=True, n_heads=n_heads, c_a=c_a, c_s=c_s, c_z=c_z, biasinit=biasinit
+            has_s=True,
+            create_offset_ln_z=False,
+            n_heads=n_heads,
+            c_a=c_a,
+            c_s=c_s,
+            c_z=c_z,
+            biasinit=biasinit,
+            cross_attention_mode=cross_attention_mode,
         )
         self.conditioned_transition_block = ConditionedTransitionBlock(
             n=2, c_a=c_a, c_s=c_s, biasinit=biasinit
+        )
+        self.drop_path = (
+            DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
 
     def forward(
@@ -261,7 +309,8 @@ class DiffusionTransformerBlock(nn.Module):
         n_keys: Optional[int] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
+        enable_efficient_fusion: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             a (torch.Tensor): the single feature aggregate per-atom representation
@@ -274,25 +323,31 @@ class DiffusionTransformerBlock(nn.Module):
             n_keys (int, optional): local window size of key tensor. Defaults to None.
             inplace_safe (bool): Whether it is safe to use inplace operations. Defaults to False.
             chunk_size (Optional[int]): Chunk size for memory-efficient operations. Defaults to None.
+            enable_efficient_fusion (bool): Whether to enable efficient fusion of bias calculation in attention to speed up. Defaults to False. (Alg 24)
 
         Returns:
-            torch.Tensor: the output of DiffusionTransformerBlock
-                [..., N, c_a]
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - out_a: the output of DiffusionTransformerBlock [..., N, c_a]
+                - s: the single embedding [..., N, c_s]
+                - z: the pair embedding
         """
-        attn_out = self.attention_pair_bias(
-            a=a,
-            s=s,
-            z=z,
-            n_queries=n_queries,
-            n_keys=n_keys,
-            inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
+        attn_out = self.drop_path(
+            self.attention_pair_bias(
+                a=a,
+                s=s,
+                z=z,
+                n_queries=n_queries,
+                n_keys=n_keys,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+                enable_efficient_fusion=enable_efficient_fusion,
+            )
         )
         if inplace_safe:
             attn_out += a
         else:
             attn_out = attn_out + a
-        ff_out = self.conditioned_transition_block(a=attn_out, s=s)
+        ff_out = self.drop_path(self.conditioned_transition_block(a=attn_out, s=s))
         out_a = ff_out + attn_out
         # Avoid s/z to be deleted by torch.utils.checkpoint
         return out_a, s, z
@@ -301,6 +356,16 @@ class DiffusionTransformerBlock(nn.Module):
 class DiffusionTransformer(nn.Module):
     """
     Implements Algorithm 23 in AF3
+
+    Args:
+        c_a (int): single embedding dimension.
+        c_s (int): single embedding dimension.
+        c_z (int): pair embedding dimension.
+        n_blocks (int): number of blocks in DiffusionTransformer.
+        n_heads (int): number of heads in attention.
+        cross_attention_mode (bool, optional): whether to use cross attention. Defaults to False.
+        drop_path_rate (float, optional): drop skip connection path rate. Defaults to 0.0.
+        blocks_per_ckpt (int, optional): number of DiffusionTransformer blocks in each activation checkpoint. Defaults to None.
     """
 
     def __init__(
@@ -310,17 +375,10 @@ class DiffusionTransformer(nn.Module):
         c_z: int,  # could be c_z or c_atompair
         n_blocks: int,  # could be 3 or 24 in AF3
         n_heads: int,  # could be 16 or 4 or ... in AF3
+        cross_attention_mode: bool = False,
+        drop_path_rate: float = 0.0,  # drop skip connection path
         blocks_per_ckpt: Optional[int] = None,
     ) -> None:
-        """
-        Args:
-            c_a (int): single embedding dimension.
-            c_s (int): single embedding dimension.
-            c_z (int): pair embedding dimension.
-            n_blocks (int): number of blocks in DiffusionTransformer.
-            n_heads (int): number of heads in attention.
-            blocks_per_ckpt: number of DiffusionTransformer blocks in each activation checkpoint
-        """
         super(DiffusionTransformer, self).__init__()
         self.n_blocks = n_blocks
         self.n_heads = n_heads
@@ -330,9 +388,18 @@ class DiffusionTransformer(nn.Module):
         self.blocks_per_ckpt = blocks_per_ckpt
 
         self.blocks = nn.ModuleList()
-        for _ in range(n_blocks):
+        drop_path_rates = [
+            drop_path_value.item()
+            for drop_path_value in torch.linspace(0, drop_path_rate, n_blocks)
+        ]
+        for i in range(n_blocks):
             block = DiffusionTransformerBlock(
-                n_heads=n_heads, c_a=c_a, c_s=c_s, c_z=c_z
+                n_heads=n_heads,
+                c_a=c_a,
+                c_s=c_s,
+                c_z=c_z,
+                cross_attention_mode=cross_attention_mode,
+                drop_path_rate=drop_path_rates[i],
             )
             self.blocks.append(block)
 
@@ -342,8 +409,8 @@ class DiffusionTransformer(nn.Module):
         n_keys: Optional[int] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
-        clear_cache_between_blocks: bool = False,
-    ):
+        enable_efficient_fusion: bool = False,
+    ) -> list[Callable]:
         blocks = [
             partial(
                 b,
@@ -351,16 +418,10 @@ class DiffusionTransformer(nn.Module):
                 n_keys=n_keys,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                enable_efficient_fusion=enable_efficient_fusion,
             )
             for b in self.blocks
         ]
-
-        def clear_cache(b, *args, **kwargs):
-            # torch.cuda.empty_cache()
-            return b(*args, **kwargs)
-
-        if clear_cache_between_blocks:
-            blocks = [partial(clear_cache, b) for b in blocks]
         return blocks
 
     def forward(
@@ -372,32 +433,30 @@ class DiffusionTransformer(nn.Module):
         n_keys: Optional[int] = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        enable_efficient_fusion: bool = False,
     ) -> torch.Tensor:
         """
-        Args:
-            a (torch.Tensor): the single feature aggregate per-atom representation
-                [..., N, c_a]
-            s (torch.Tensor): single embedding
-                [..., N, c_s]
-            z (torch.Tensor): pair embedding
-                [..., N, N, c_z]
-            n_queries (int, optional): local window size of query tensor. If not None, will perform local attention. Defaults to None.
-            n_keys (int, optional): local window size of key tensor. Defaults to None.
+                Args:
+                    a (torch.Tensor): the single feature aggregate per-atom representation
+                        [..., N, c_a]
+                    s (torch.Tensor): single embedding
+                        [..., N, c_s]
+                    z (torch.Tensor): pair embedding
+                        [..., N, N, c_z]
+                    n_queries (int, optional): local window size of query tensor. If not None, will perform local attention. Defaults to None.
+                    n_keys (int, optional): local window size of key tensor. Defaults to None.
+        enable_efficient_fusion (bool): Whether to enable efficient fusion of bias calculation in attention to speed up. Defaults to False. (Alg 24)
 
-        Returns:
-            torch.Tensor: the output of DiffusionTransformer
-                [..., N, c_a]
+                Returns:
+                    torch.Tensor: the output of DiffusionTransformer
+                        [..., N, c_a]
         """
-        if z.shape[-2] > 2000 and (not self.training):
-            clear_cache_between_blocks = True
-        else:
-            clear_cache_between_blocks = False
         blocks = self._prep_blocks(
             n_queries=n_queries,
             n_keys=n_keys,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
-            clear_cache_between_blocks=clear_cache_between_blocks,
+            enable_efficient_fusion=enable_efficient_fusion,
         )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
@@ -412,6 +471,17 @@ class DiffusionTransformer(nn.Module):
 class AtomTransformer(nn.Module):
     """
     Implements Algorithm 7 in AF3
+
+    Performs local transformer among atom embeddings, with bias predicted from atom pair embeddings
+
+    Args:
+        c_atom (int, optional): embedding dim for atom feature. Defaults to 128.
+        c_atompair (int, optional): embedding dim for atompair feature. Defaults to 16.
+        n_blocks (int, optional): number of block in AtomTransformer. Defaults to 3.
+        n_heads (int, optional): number of heads in attention. Defaults to 4.
+        n_queries (int, optional): local window size of query tensor. If not None, will perform local attention. Defaults to 32.
+        n_keys (int, optional): local window size of key tensor. Defaults to 128.
+        blocks_per_ckpt (int, optional): number of AtomTransformer/DiffusionTransformer blocks in each activation checkpoint. Defaults to None.
     """
 
     def __init__(
@@ -424,20 +494,6 @@ class AtomTransformer(nn.Module):
         n_keys: int = 128,
         blocks_per_ckpt: Optional[int] = None,
     ) -> None:
-        """Performs local transformer among atom embeddings, with bias predicted from atom pair embeddings
-
-        Args:
-            c_atom int: embedding dim for atom feature. Defaults to 128.
-            c_atompair int: embedding dim for atompair feature. Defaults to 16.
-            n_blocks (int, optional): number of block in AtomTransformer. Defaults to 3.
-            n_heads (int, optional): nubmer of heads in attention. Defaults to 4.
-            n_queries (int, optional): local window size of query tensor. If not None, will perform local attention. Defaults to 32.
-            n_keys (int, optional): local window size of key tensor. Defaults to 128.
-            blocks_per_ckpt: number of AtomTransformer/DiffusionTransformer blocks in each activation checkpoint
-                Size of each chunk. A higher value corresponds to fewer
-                checkpoints, and trades memory for speed. If None, no checkpointing
-                is performed.
-        """
         super(AtomTransformer, self).__init__()
         self.n_blocks = n_blocks
         self.n_heads = n_heads
@@ -451,6 +507,7 @@ class AtomTransformer(nn.Module):
             c_a=c_atom,
             c_s=c_atom,
             c_z=c_atompair,
+            cross_attention_mode=True,
             blocks_per_ckpt=blocks_per_ckpt,
         )
 
@@ -493,22 +550,26 @@ class AtomTransformer(nn.Module):
 class ConditionedTransitionBlock(nn.Module):
     """
     Implements Algorithm 25 in AF3
+
+    Args:
+        c_a (int): single embedding dim (single feature aggregated atom info).
+        c_s (int):  single embedding dim.
+        n (int, optional): channel scale factor. Defaults to 2.
+        biasinit (float, optional): bias initialization value. Defaults to -2.0.
     """
 
     def __init__(self, c_a: int, c_s: int, n: int = 2, biasinit: float = -2.0) -> None:
-        """
-        Args:
-            c_a (int, optional): single embedding dim (single feature aggregated atom info).
-            c_s (int, optional):  single embedding dim.
-            n (int, optional): channel scale factor. Defaults to 2.
-        """
         super(ConditionedTransitionBlock, self).__init__()
         self.c_a = c_a
         self.c_s = c_s
         self.n = n
         self.adaln = AdaptiveLayerNorm(c_a=c_a, c_s=c_s)
-        self.linear_nobias_a1 = LinearNoBias(in_features=c_a, out_features=n * c_a)
-        self.linear_nobias_a2 = LinearNoBias(in_features=c_a, out_features=n * c_a)
+        self.linear_nobias_a1 = LinearNoBias(
+            in_features=c_a, out_features=n * c_a, initializer="relu"
+        )
+        self.linear_nobias_a2 = LinearNoBias(
+            in_features=c_a, out_features=n * c_a, initializer="relu"
+        )
         self.linear_nobias_b = LinearNoBias(in_features=n * c_a, out_features=c_a)
         self.linear_s = BiasInitLinear(
             in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
@@ -536,6 +597,19 @@ class ConditionedTransitionBlock(nn.Module):
 class AtomAttentionEncoder(nn.Module):
     """
     Implements Algorithm 5 in AF3
+
+    Args:
+        has_coords (bool): whether the module input will contains coordinates (r_l).
+        c_token (int): token embedding dim.
+        c_atom (int, optional): atom embedding dim. Defaults to 128.
+        c_atompair (int, optional): atompair embedding dim. Defaults to 16.
+        c_s (int, optional):  single embedding dim. Defaults to 384.
+        c_z (int, optional): pair embedding dim. Defaults to 128.
+        n_blocks (int, optional): number of blocks in AtomTransformer. Defaults to 3.
+        n_heads (int, optional): number of heads in AtomTransformer. Defaults to 4.
+        n_queries (int, optional): local window size of query tensor. Defaults to 32.
+        n_keys (int, optional): local window size of key tensor. Defaults to 128.
+        blocks_per_ckpt (int, optional): number of AtomAttentionEncoder/AtomTransformer blocks in each activation checkpoint. Defaults to None.
     """
 
     def __init__(
@@ -552,21 +626,6 @@ class AtomAttentionEncoder(nn.Module):
         n_keys: int = 128,
         blocks_per_ckpt: Optional[int] = None,
     ) -> None:
-        """
-        Args:
-            has_coords (bool): whether the module input will contains coordinates (r_l).
-            c_token (int): token embedding dim.
-            c_atom (int, optional): atom embedding dim. Defaults to 128.
-            c_atompair (int, optional): atompair embedding dim. Defaults to 16.
-            c_s (int, optional):  single embedding dim. Defaults to 384.
-            c_z (int, optional): pair embedding dim. Defaults to 128.
-            n_blocks (int, optional): number of blocks in AtomTransformer. Defaults to 3.
-            n_heads (int, optionall): number of heads in AtomTransformer. Defaults to 4.
-            blocks_per_ckpt: number of AtomAttentionEncoder/AtomTransformer blocks in each activation checkpoint
-                Size of each chunk. A higher value corresponds to fewer
-                checkpoints, and trades memory for speed. If None, no checkpointing
-                is performed.
-        """
         super(AtomAttentionEncoder, self).__init__()
         self.has_coords = has_coords
         self.c_atom = c_atom
@@ -579,17 +638,23 @@ class AtomAttentionEncoder(nn.Module):
         self.local_attention_method = "local_cross_attention"
 
         self.input_feature = {
-            "ref_pos": 3,
-            "ref_charge": 1,
+            # "ref_pos": 3,
+            # "ref_charge": 1,
             "ref_mask": 1,
             "ref_element": 128,
             "ref_atom_name_chars": 4 * 64,
         }
+        self.linear_no_bias_ref_pos = LinearNoBias(
+            in_features=3, out_features=self.c_atom, precision=torch.float32
+        )  # use high precision for ref_pos
+        self.linear_no_bias_ref_charge = LinearNoBias(
+            in_features=1, out_features=self.c_atom
+        )
         self.linear_no_bias_f = LinearNoBias(
             in_features=sum(self.input_feature.values()), out_features=self.c_atom
         )
         self.linear_no_bias_d = LinearNoBias(
-            in_features=3, out_features=self.c_atompair
+            in_features=3, out_features=self.c_atompair, precision=torch.float32
         )
         self.linear_no_bias_invd = LinearNoBias(
             in_features=1, out_features=self.c_atompair
@@ -600,18 +665,26 @@ class AtomAttentionEncoder(nn.Module):
 
         if self.has_coords:
             # Line9
-            self.layernorm_s = LayerNorm(self.c_s)
+            self.layernorm_s = LayerNorm(self.c_s, create_offset=False)
             self.linear_no_bias_s = LinearNoBias(
-                in_features=self.c_s, out_features=self.c_atom
+                in_features=self.c_s,
+                out_features=self.c_atom,
+                initializer="zeros",
+                precision=torch.float32,
             )
             # Line10
-            self.layernorm_z = LayerNorm(self.c_z)  # memory bottleneck
+            self.layernorm_z = LayerNorm(
+                self.c_z, create_offset=False
+            )  # memory bottleneck
             self.linear_no_bias_z = LinearNoBias(
-                in_features=self.c_z, out_features=self.c_atompair
+                in_features=self.c_z,
+                out_features=self.c_atompair,
+                initializer="zeros",
+                precision=torch.float32,
             )
             # Line11
             self.linear_no_bias_r = LinearNoBias(
-                in_features=3, out_features=self.c_atom
+                in_features=3, out_features=self.c_atom, precision=torch.float32
             )
         self.linear_no_bias_cl = LinearNoBias(
             in_features=self.c_atom, out_features=self.c_atompair
@@ -621,11 +694,23 @@ class AtomAttentionEncoder(nn.Module):
         )
         self.small_mlp = nn.Sequential(
             nn.ReLU(),
-            LinearNoBias(in_features=self.c_atompair, out_features=self.c_atompair),
+            LinearNoBias(
+                in_features=self.c_atompair,
+                out_features=self.c_atompair,
+                initializer="relu",
+            ),
             nn.ReLU(),
-            LinearNoBias(in_features=self.c_atompair, out_features=self.c_atompair),
+            LinearNoBias(
+                in_features=self.c_atompair,
+                out_features=self.c_atompair,
+                initializer="relu",
+            ),
             nn.ReLU(),
-            LinearNoBias(in_features=self.c_atompair, out_features=self.c_atompair),
+            LinearNoBias(
+                in_features=self.c_atompair,
+                out_features=self.c_atompair,
+                initializer="zeros",
+            ),
         )
         self.atom_transformer = AtomTransformer(
             n_blocks=n_blocks,
@@ -640,55 +725,125 @@ class AtomAttentionEncoder(nn.Module):
             in_features=self.c_atom, out_features=self.c_token
         )
 
-    def linear_init(
+    def prepare_cache(
         self,
-        zero_init_atom_encoder_residual_linear: bool = False,
-        he_normal_init_atom_encoder_small_mlp: bool = False,
-        he_normal_init_atom_encoder_output: bool = False,
-    ):
-        """
-        Initializes the parameters of the diffusion module according to the provided initialization configuration.
-
-        Args:
-            zero_init_atom_encoder_residual_linear (bool): Whether to zero-initialize the residual linear layers.
-            he_normal_init_atom_encoder_small_mlp (bool): Whether to initialize the small MLP layers with He normal initialization.
-            he_normal_init_atom_encoder_output (bool): Whether to initialize the output layer with He normal initialization.
-        """
-
-        if zero_init_atom_encoder_residual_linear:
-            nn.init.zeros_(self.linear_no_bias_invd.weight)
-            nn.init.zeros_(self.linear_no_bias_v.weight)
-            nn.init.zeros_(self.linear_no_bias_s.weight)
-            nn.init.zeros_(self.linear_no_bias_z.weight)
-            nn.init.zeros_(self.linear_no_bias_r.weight)
-            nn.init.zeros_(self.linear_no_bias_cl.weight)
-            nn.init.zeros_(self.linear_no_bias_cm.weight)
-        if he_normal_init_atom_encoder_small_mlp:
-            for layer in self.small_mlp:
-                if not isinstance(layer, torch.nn.modules.activation.ReLU):
-                    nn.init.kaiming_normal_(
-                        layer.weight,
-                        a=0,
-                        mode="fan_in",
-                        nonlinearity="relu",
-                    )
-        if he_normal_init_atom_encoder_output:
-            nn.init.kaiming_normal_(
-                self.linear_no_bias_q.weight, a=0, mode="fan_in", nonlinearity="relu"
+        ref_pos: torch.Tensor,
+        ref_charge: torch.Tensor,
+        ref_mask: torch.Tensor,
+        ref_element: torch.Tensor,
+        ref_atom_name_chars: torch.Tensor,
+        atom_to_token_idx: torch.Tensor,
+        d_lm: torch.Tensor,
+        v_lm: torch.Tensor,
+        pad_info: torch.Tensor,
+        r_l: Union[torch.Tensor, bool, None] = None,
+        z: torch.Tensor = None,
+        inplace_safe: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_shape = ref_pos.shape[:-2]
+        N_atom = ref_pos.shape[-2]
+        c_l = self.linear_no_bias_ref_pos(ref_pos) + self.linear_no_bias_ref_charge(
+            # use arcsinh for ref_charge
+            torch.arcsinh(ref_charge).reshape(*batch_shape, N_atom, 1)
+        )
+        if inplace_safe:
+            c_l += self.linear_no_bias_f(
+                torch.cat(
+                    [
+                        ref_mask.reshape(*batch_shape, N_atom, 1),
+                        ref_element.reshape(*batch_shape, N_atom, 128),
+                        ref_atom_name_chars.reshape(*batch_shape, N_atom, 4 * 64),
+                    ],
+                    dim=-1,
+                ).to(dtype=c_l.dtype)
             )
+            c_l *= ref_mask.reshape(*batch_shape, N_atom, 1)
+        else:
+            c_l = c_l + self.linear_no_bias_f(
+                torch.cat(
+                    [
+                        ref_mask.reshape(*batch_shape, N_atom, 1),
+                        ref_element.reshape(*batch_shape, N_atom, 128),
+                        ref_atom_name_chars.reshape(*batch_shape, N_atom, 4 * 64),
+                    ],
+                    dim=-1,
+                ).to(dtype=c_l.dtype)
+            )
+            c_l = c_l * ref_mask.reshape(*batch_shape, N_atom, 1)
+
+        p_lm = (self.linear_no_bias_d(d_lm) * v_lm) * pad_info[
+            "mask_trunked"
+        ].unsqueeze(
+            dim=-1
+        )  # [..., n_blocks, n_queries, n_keys, C_atompair]
+
+        # Line5-Line6: Embed pairwise inverse squared distances, and the valid mask
+        if inplace_safe:
+            p_lm += (
+                self.linear_no_bias_invd(
+                    1 / (1 + (d_lm**2).sum(dim=-1, keepdim=True))
+                )
+                * v_lm
+            )
+            p_lm += self.linear_no_bias_v(
+                v_lm.to(dtype=p_lm.dtype)
+            )  # not multipling v_lm
+        else:
+            p_lm = (
+                p_lm
+                + self.linear_no_bias_invd(
+                    1 / (1 + (d_lm**2).sum(dim=-1, keepdim=True))
+                )
+                * v_lm
+            )
+            p_lm = p_lm + self.linear_no_bias_v(
+                v_lm.to(dtype=p_lm.dtype)
+            )  # not multipling v_lm
+
+        # Line7: Initialise the atom single representation as the single conditioning
+        # q_l = c_l.clone()
+
+        # If provided, add trunk embeddings and noisy positions
+        if r_l is not None:
+            p_lm = (
+                p_lm.unsqueeze(dim=-5)
+                + broadcast_token_to_local_atom_pair(
+                    z_token=self.linear_no_bias_z(self.layernorm_z(z)),
+                    atom_to_token_idx=atom_to_token_idx,
+                    n_queries=self.n_queries,
+                    n_keys=self.n_keys,
+                    compute_mask=False,
+                )[0]
+            )  # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
+        return p_lm, c_l
 
     def forward(
         self,
-        input_feature_dict: dict[str, Union[torch.Tensor, int, float, dict]],
+        atom_to_token_idx: torch.Tensor,
+        ref_pos: torch.Tensor,
+        ref_charge: torch.Tensor,
+        ref_mask: torch.Tensor,
+        ref_atom_name_chars: torch.Tensor,
+        ref_element: torch.Tensor,
+        d_lm: torch.Tensor,
+        v_lm: torch.Tensor,
+        pad_info: torch.Tensor,
         r_l: torch.Tensor = None,
         s: torch.Tensor = None,
         z: torch.Tensor = None,
+        p_lm: torch.Tensor = None,
+        c_l: torch.Tensor = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            input_feature_dict (dict[str, Union[torch.Tensor, int, float, dict]]): input meta feature dict
+            atom_to_token_idx (torch.Tensor): atom_to_token_idx
+            ref_pos (torch.Tensor): ref_pos
+            ref_charge (torch.Tensor): ref_charge
+            ref_mask (torch.Tensor): ref_mask
+            ref_atom_name_chars (torch.Tensor): ref_atom_name_chars
+            ref_element (torch.Tensor): ref_element
             r_l (torch.Tensor, optional): noisy position.
                 [..., N_sample, N_atom, 3] if has_coords else None.
             s (torch.Tensor, optional): single embedding.
@@ -714,100 +869,46 @@ class AtomAttentionEncoder(nn.Module):
             assert s is not None
             assert z is not None
 
-        atom_to_token_idx = input_feature_dict["atom_to_token_idx"]
-        # Create the atom single conditioning: Embed per-atom meta data
-        # [..., N_atom, C_atom]
-        batch_shape = input_feature_dict["ref_pos"].shape[:-2]
-        N_atom = input_feature_dict["ref_pos"].shape[-2]
-        c_l = self.linear_no_bias_f(
-            torch.cat(
-                [
-                    input_feature_dict[name].reshape(
-                        *batch_shape, N_atom, self.input_feature[name]
-                    )
-                    for name in self.input_feature
-                ],
-                dim=-1,
+        if p_lm is None or c_l is None:
+            p_lm, c_l = self.prepare_cache(
+                ref_pos=ref_pos,
+                ref_charge=ref_charge,
+                ref_mask=ref_mask,
+                ref_atom_name_chars=ref_atom_name_chars,
+                ref_element=ref_element,
+                atom_to_token_idx=atom_to_token_idx,
+                d_lm=d_lm,
+                v_lm=v_lm,
+                pad_info=pad_info,
+                r_l=r_l,
+                z=z,
+                inplace_safe=inplace_safe,
             )
-        )
-
-        # Line2-Line4: Embed offsets between atom reference positions
-
-        # Prepare tensors in dense trunks for local operations
-        q_trunked_list, k_trunked_list, pad_info = rearrange_qk_to_dense_trunk(
-            q=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
-            k=[input_feature_dict["ref_pos"], input_feature_dict["ref_space_uid"]],
-            dim_q=[-2, -1],
-            dim_k=[-2, -1],
-            n_queries=self.n_queries,
-            n_keys=self.n_keys,
-            compute_mask=True,
-        )
-
-        # Compute atom pair feature
-        d_lm = (
-            q_trunked_list[0][..., None, :] - k_trunked_list[0][..., None, :, :]
-        )  # [..., n_blocks, n_queries, n_keys, 3]
-        v_lm = (
-            q_trunked_list[1][..., None].int() == k_trunked_list[1][..., None, :].int()
-        ).unsqueeze(
-            dim=-1
-        )  # [..., n_blocks, n_queries, n_keys, 1]
-        p_lm = (self.linear_no_bias_d(d_lm) * v_lm) * pad_info[
-            "mask_trunked"
-        ].unsqueeze(
-            dim=-1
-        )  # [..., n_blocks, n_queries, n_keys, C_atompair]
-
-        # Line5-Line6: Embed pairwise inverse squared distances, and the valid mask
-        if inplace_safe:
-            p_lm += (
-                self.linear_no_bias_invd(1 / (1 + (d_lm**2).sum(dim=-1, keepdim=True)))
-                * v_lm
-            )
-            p_lm += self.linear_no_bias_v(v_lm.to(dtype=p_lm.dtype)) * v_lm
         else:
-            p_lm = (
-                p_lm
-                + self.linear_no_bias_invd(
-                    1 / (1 + (d_lm**2).sum(dim=-1, keepdim=True))
-                )
-                * v_lm
-            )
-            p_lm = p_lm + self.linear_no_bias_v(v_lm.to(dtype=p_lm.dtype)) * v_lm
+            if inplace_safe:
+                p_lm_clone = p_lm.clone()
+                c_l_clone = c_l.clone()
+                p_lm = p_lm_clone
+                c_l = c_l_clone
 
         # Line7: Initialise the atom single representation as the single conditioning
-        q_l = c_l.clone()
+        # q_l = c_l.clone()
 
         # If provided, add trunk embeddings and noisy positions
         n_token = None
         if r_l is not None:
-            N_sample = r_l.size(-3)
-
             # Broadcast the single and pair embedding from the trunk
             n_token = s.size(-2)
-            c_l = c_l.unsqueeze(dim=-3) + self.linear_no_bias_s(
-                self.layernorm_s(
-                    broadcast_token_to_atom(
-                        x_token=s, atom_to_token_idx=atom_to_token_idx
-                    )
-                )
-            )  # [..., N_sample, N_atom, c_atom]
-            z_local_pairs, _ = broadcast_token_to_local_atom_pair(
-                z_token=z,
+            c_l = c_l.unsqueeze(dim=-3) + broadcast_token_to_atom(
+                x_token=self.linear_no_bias_s(self.layernorm_s(s)),
                 atom_to_token_idx=atom_to_token_idx,
-                n_queries=self.n_queries,
-                n_keys=self.n_keys,
-                compute_mask=False,
-            )  # [..., N_sample, n_blocks, n_queries, n_keys, c_z]
-            p_lm = p_lm.unsqueeze(dim=-5) + self.linear_no_bias_z(
-                self.layernorm_z(z_local_pairs)
-            )  # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
+            )  # [..., N_sample, N_atom, c_atom]
 
             # Add the noisy positions
-            q_l = q_l.unsqueeze(dim=-3) + self.linear_no_bias_r(
-                r_l
-            )  # [..., N_sample, N_atom, c_atom]
+            # Different from paper!!
+            q_l = c_l + self.linear_no_bias_r(r_l)  # [..., N_sample, N_atom, c_atom]
+        else:
+            q_l = c_l.clone()
 
         # Add the combined single conditioning to the pair representation
         c_l_q, c_l_k, _ = rearrange_qk_to_dense_trunk(
@@ -820,7 +921,7 @@ class AtomAttentionEncoder(nn.Module):
             compute_mask=False,
         )
         if inplace_safe:
-            p_lm += self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
+            p_lm = p_lm + self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
             p_lm += self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
             p_lm += self.small_mlp(p_lm)
         else:
@@ -845,14 +946,22 @@ class AtomAttentionEncoder(nn.Module):
             n_token=n_token,
             reduce="mean",
         )  # [..., (N_sample), N_token, c_token]
-        if (not self.training) and (a.shape[-2] > 2000 or q_l.shape[-2] > 20000):
-            torch.cuda.empty_cache()
         return a, q_l, c_l, p_lm
 
 
 class AtomAttentionDecoder(nn.Module):
     """
     Implements Algorithm 6 in AF3
+
+    Args:
+        n_blocks (int, optional): number of blocks for AtomTransformer. Defaults to 3.
+        n_heads (int, optional): number of heads for AtomTransformer. Defaults to 4.
+        c_token (int, optional): feature channel of token (single a). Defaults to 384.
+        c_atom (int, optional): embedding dim for atom embedding. Defaults to 128.
+        c_atompair (int, optional): embedding dim for atom pair embedding. Defaults to 16.
+        n_queries (int, optional): local window size of query tensor. Defaults to 32.
+        n_keys (int, optional): local window size of key tensor. Defaults to 128.
+        blocks_per_ckpt (int, optional): number of AtomAttentionDecoder/AtomTransformer blocks in each activation checkpoint. Defaults to None.
     """
 
     def __init__(
@@ -866,18 +975,6 @@ class AtomAttentionDecoder(nn.Module):
         n_keys: int = 128,
         blocks_per_ckpt: Optional[int] = None,
     ) -> None:
-        """
-        Args:
-            n_blocks (int, optional): number of blocks for AtomTransformer. Defaults to 3.
-            n_heads (int, optional): number of heads for AtomTransformer. Defaults to 4.
-            c_token (int, optional): feature channel of token (single a). Defaults to 384.
-            c_atom (int, optional): embedding dim for atom embedding. Defaults to 128.
-            c_atompair (int, optional): embedding dim for atom pair embedding.
-            blocks_per_ckpt: number of AtomAttentionDecoder/AtomTransformer blocks in each activation checkpoint
-                Size of each chunk. A higher value corresponds to fewer
-                checkpoints, and trades memory for speed. If None, no checkpointing
-                is performed.
-        """
         super(AtomAttentionDecoder, self).__init__()
         self.n_blocks = n_blocks
         self.n_heads = n_heads
@@ -887,8 +984,10 @@ class AtomAttentionDecoder(nn.Module):
         self.n_queries = n_queries
         self.n_keys = n_keys
         self.linear_no_bias_a = LinearNoBias(in_features=c_token, out_features=c_atom)
-        self.layernorm_q = LayerNorm(c_atom)
-        self.linear_no_bias_out = LinearNoBias(in_features=c_atom, out_features=3)
+        self.layernorm_q = LayerNorm(c_atom, create_offset=False)
+        self.linear_no_bias_out = LinearNoBias(
+            in_features=c_atom, out_features=3, precision=torch.float32
+        )
         self.atom_transformer = AtomTransformer(
             n_blocks=n_blocks,
             n_heads=n_heads,
@@ -901,7 +1000,7 @@ class AtomAttentionDecoder(nn.Module):
 
     def forward(
         self,
-        input_feature_dict: dict[str, Union[torch.Tensor, int, float, dict]],
+        atom_to_token_idx: torch.Tensor,
         a: torch.Tensor,
         q_skip: torch.Tensor,
         c_skip: torch.Tensor,
@@ -911,7 +1010,8 @@ class AtomAttentionDecoder(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            input_feature_dict (dict[str, Union[torch.Tensor, int, float, dict]]): input meta feature dict
+            atom_to_token_idx (torch.Tensor): the atom to token index
+                [..., N_atom]
             a (torch.Tensor): the single feature aggregate per-atom representation
                 [..., N_token, c_token]
             q_skip (torch.Tensor): atom single embedding
@@ -922,15 +1022,14 @@ class AtomAttentionDecoder(nn.Module):
                 [..., n_blocks, n_queries, n_keys, c_atompair]
 
         Returns:
-            torch.Tensor: the updated nosiy coordinates
+            torch.Tensor: the updated noisy coordinates
                 [..., N_atom, 3]
         """
         # Broadcast per-token activiations to per-atom activations and add the skip connection
         q = (
-            self.linear_no_bias_a(
-                broadcast_token_to_atom(
-                    x_token=a, atom_to_token_idx=input_feature_dict["atom_to_token_idx"]
-                )  # [..., N_atom, c_token]
+            broadcast_token_to_atom(
+                x_token=self.linear_no_bias_a(a),  # [..., N_token, c_atom]
+                atom_to_token_idx=atom_to_token_idx,
             )  # [..., N_atom, c_atom]
             + q_skip
         )

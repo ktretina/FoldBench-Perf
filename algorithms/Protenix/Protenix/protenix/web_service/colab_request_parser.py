@@ -12,30 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import json
 import os
 import subprocess
 import traceback
 from collections import defaultdict
 from copy import deepcopy
-from os.path import exists as opexists
-from os.path import join as opjoin
+from os.path import exists as opexists, join as opjoin
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
-
-import protenix.data.ccd as ccd
 import requests
-from protenix.data.json_to_feature import SampleDictToFeatures
-from protenix.web_service.colab_request_utils import run_mmseqs2_service
+from runner.template_search import run_template_search
+
+import protenix.data.core.ccd as ccd
+from protenix.data.inference.json_to_feature import SampleDictToFeatures
+from protenix.web_service.colab_request_utils import (
+    parse_fasta_string,
+    run_mmseqs2_service,
+)
 from protenix.web_service.dependency_url import URL
 
-MMSEQS_SERVICE_HOST_URL = "http://101.126.11.40:80"
+MMSEQS_SERVICE_HOST_URL = os.getenv(
+    "MMSEQS_SERVICE_HOST_URL", "https://protenix-server.com/api/msa"
+)
 MAX_ATOM_NUM = 60000
 MAX_TOKEN_NUM = 5000
-DATA_CACHE_DIR = "/af3-dev/release_data/"
-CHECKPOINT_DIR = "/af3-dev/release_model/"
+
+PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
+
+DATA_CACHE_DIR = f"{PROTENIX_ROOT_DIR}/common/"
+CHECKPOINT_DIR = f"{PROTENIX_ROOT_DIR}/checkpoint/"
 
 
 def download_tos_url(tos_url, local_file_path):
@@ -75,11 +84,19 @@ class TooLargeComplexError(Exception):
 
 
 class RequestParser(object):
-    def __init__(self, request_json_path: str, request_dir: str) -> None:
+    def __init__(
+        self,
+        request_json_path: str,
+        request_dir: str,
+        email: str = "",
+        model_name: str = "protenix_base_default_v1.0.0",
+    ) -> None:
         with open(request_json_path, "r") as f:
             self.request = json.load(f)
         self.request_dir = request_dir
         self.fpath = os.path.abspath(__file__)
+        self.email = email
+        self.model_name = model_name
         os.makedirs(self.request_dir, exist_ok=True)
 
     def download_data_cache(self) -> Dict[str, str]:
@@ -87,8 +104,9 @@ class RequestParser(object):
         os.makedirs(data_cache_dir, exist_ok=True)
         cache_paths = {}
         for cache_name, fname in [
-            ("ccd_components_file", "components.v20240608.cif"),
-            ("ccd_components_rdkit_mol_file", "components.v20240608.cif.rdkit_mol.pkl"),
+            ("ccd_components_file", "components.cif"),
+            ("ccd_components_rdkit_mol_file", "components.cif.rdkit_mol.pkl"),
+            ("pdb_cluster_file", "clusters-by-entity-40.txt"),
         ]:
             if not opexists(
                 cache_path := os.path.abspath(opjoin(data_cache_dir, fname))
@@ -99,21 +117,20 @@ class RequestParser(object):
             cache_paths[cache_name] = cache_path
         return cache_paths
 
-    def download_model(self, model_version: str, checkpoint_local_path: str) -> None:
-        tos_url = URL[f"model_{model_version}"]
+    def download_model(self, model_name: str, checkpoint_local_path: str) -> None:
+        tos_url = URL[f"{model_name}"]
         print(f"Downloading model checkpoing from\n {tos_url}...")
         download_tos_url(tos_url, checkpoint_local_path)
 
     def get_model(self) -> str:
         checkpoint_dir = CHECKPOINT_DIR
         os.makedirs(checkpoint_dir, exist_ok=True)
-        model_version = self.request["model_version"]
         if not opexists(
-            checkpoint_path := opjoin(checkpoint_dir, f"model_{model_version}.pt")
+            checkpoint_path := opjoin(checkpoint_dir, f"{self.model_name}.pt")
         ):
-            self.download_model(model_version, checkpoint_local_path=checkpoint_path)
+            self.download_model(self.model_name, checkpoint_local_path=checkpoint_path)
         if opexists(checkpoint_path):
-            return checkpoint_path
+            return checkpoint_dir
         else:
             raise ValueError("Failed in finding model checkpoint.")
 
@@ -122,7 +139,7 @@ class RequestParser(object):
             "name": (self.request["name"]),
             "covalent_bonds": self.request["covalent_bonds"],
         }
-        input_json_path = opjoin(self.request_dir, f"inputs.json")
+        input_json_path = opjoin(self.request_dir, "inputs.json")
 
         sequences = []
         entity_pending_msa = {}
@@ -179,6 +196,8 @@ class RequestParser(object):
                 seqs_pending_msa=seqs_pending_msa,
                 tmp_fasta_fpath=tmp_fasta_fpath,
                 msa_res_dir=msa_res_dir,
+                email=self.email,
+                mode="protenix",
             )
             msa_res_subdirs = RequestParser.msa_postprocess(
                 seqs_pending_msa=seqs_pending_msa,
@@ -188,14 +207,33 @@ class RequestParser(object):
             for seq, msa_res_dir in zip(seqs_pending_msa, msa_res_subdirs):
                 for entity_id in seq_to_entity_id[seq]:
                     entity_index = int(entity_id) - 1
-                    sequences[entity_index]["proteinChain"]["msa"] = {
-                        "precomputed_msa_dir": msa_res_dir,
-                        "pairing_db": "uniref100",
-                        "pairing_db_fpath": None,
-                        "non_pairing_db_fpath": None,
-                        "search_too": None,
-                        "msa_save_dir": None,
-                    }
+                    msa_names = []
+                    if opexists(pairing_path := opjoin(msa_res_dir, "pairing.a3m")):
+                        sequences[entity_index]["proteinChain"][
+                            "pairedMsaPath"
+                        ] = pairing_path
+                        msa_names.append("pairing")
+                    if opexists(
+                        unpaired_path := opjoin(msa_res_dir, "non_pairing.a3m")
+                    ):
+                        sequences[entity_index]["proteinChain"][
+                            "unpairedMsaPath"
+                        ] = unpaired_path
+                        msa_names.append("non_pairing")
+                    use_msa = self.request.get("use_msa")
+                    use_template = self.request.get("use_template", False)
+                    if msa_names and use_msa and use_template:
+                        msa_name_str = ",".join(msa_names)
+                        if not opexists(
+                            template_path := opjoin(msa_res_dir, "hmmsearch.a3m")
+                        ):
+                            run_template_search(
+                                msa_for_template_search_dir=msa_res_dir,
+                                msa_for_template_search_name=msa_name_str,
+                            )
+                        sequences[entity_index]["proteinChain"][
+                            "templatesPath"
+                        ] = template_path
 
         input_json_dict["sequences"] = sequences
         with open(input_json_path, "w") as f:
@@ -204,7 +242,11 @@ class RequestParser(object):
 
     @staticmethod
     def msa_search(
-        seqs_pending_msa: Sequence[str], tmp_fasta_fpath: str, msa_res_dir: str
+        seqs_pending_msa: Sequence[str],
+        tmp_fasta_fpath: str,
+        msa_res_dir: str,
+        email: str = "",
+        mode: str = "protenix",
     ) -> None:
         lines = []
         for idx, seq in enumerate(seqs_pending_msa):
@@ -213,23 +255,80 @@ class RequestParser(object):
         if (last_line := lines[-1]).endswith("\n"):
             lines[-1] = last_line.rstrip("\n")
         with open(tmp_fasta_fpath, "w") as f:
-            for lines in lines:
-                f.write(lines)
+            for line in lines:
+                f.write(line)
 
         with open(tmp_fasta_fpath, "r") as f:
             query_seqs = f.read()
-        try:
-            run_mmseqs2_service(
-                query_seqs,
-                msa_res_dir,
-                True,
-                use_templates=False,
-                host_url=MMSEQS_SERVICE_HOST_URL,
-                user_agent="colabfold/1.5.5",
-            )
-        except Exception as e:
-            error_message = f"MMSEQS2 failed with the following error message:\n{traceback.format_exc()}"
-            print(error_message)
+        if mode == "protenix":
+            try:
+                run_mmseqs2_service(
+                    query_seqs,
+                    msa_res_dir,
+                    True,
+                    use_templates=False,
+                    host_url=MMSEQS_SERVICE_HOST_URL,
+                    user_agent="colabfold/1.5.5",
+                    email=email,
+                    server_mode=mode,
+                )
+            except Exception as e:
+                error_message = f"MMSEQS2 failed with the following error message:\n{traceback.format_exc()}"
+                print(error_message)
+
+        elif mode == "colabfold":
+            res_dirs = []
+            fasta_dict = parse_fasta_string(query_seqs)
+            for i, (seq_name, seq) in enumerate(fasta_dict.items()):
+                print(f"Searching MSA for {seq_name} with the sequence itself.")
+                try:
+                    res_dir = run_mmseqs2_service(
+                        f">{seq_name}\n{seq}",
+                        os.path.join(msa_res_dir, str(i)),
+                        use_env=True,
+                        use_filter=True,
+                        use_templates=False,
+                        filter=None,
+                        use_pairing=False,
+                        pairing_strategy="greedy",
+                        host_url=MMSEQS_SERVICE_HOST_URL,
+                        user_agent="colabfold/1.5.5",
+                        email=email,
+                        server_mode=mode,
+                    )
+                    res_dirs.append(res_dir)
+                except Exception as e:
+                    error_message = f"MMSEQS2 failed with the following error message:\n{traceback.format_exc()}"
+                    print(error_message)
+            if len(fasta_dict) > 1:
+                # search paired MSA
+                try:
+                    run_mmseqs2_service(
+                        query_seqs,
+                        os.path.join(msa_res_dir, "complex"),
+                        use_env=True,
+                        use_filter=True,
+                        use_templates=False,
+                        filter=None,
+                        use_pairing=True,
+                        pairing_strategy="greedy",
+                        host_url=MMSEQS_SERVICE_HOST_URL,
+                        user_agent="colabfold/1.5.5",
+                        email=email,
+                        server_mode=mode,
+                    )
+                except Exception as e:
+                    error_message = f"MMSEQS2 failed with the following error message:\n{traceback.format_exc()}"
+                    print(error_message)
+            else:
+                pairing_msa_fpath = os.path.join(
+                    msa_res_dir,
+                    "0",
+                    "pairing.a3m",
+                )
+                with open(pairing_msa_fpath, "w") as f:
+                    f.write(">query\n" + query_seqs.split("\n")[-1])
+            return res_dirs
 
     @staticmethod
     def msa_postprocess(seqs_pending_msa: Sequence[str], msa_res_dir: str) -> None:
@@ -246,13 +345,20 @@ class RequestParser(object):
         def read_a3m(a3m_file: str) -> Tuple[List[str], List[str]]:
             heads = []
             seqs = []
+            # Record the row index. The index before this index is the MSA of Uniref30 DB,
+            # and the index after this index is the MSA of ColabfoldDB.
+            uniref_index = 0
             with open(a3m_file, "r") as infile:
-                for line in infile:
+                for idx, line in enumerate(infile):
                     if line.startswith(">"):
                         heads.append(line)
+                        if idx == 0:
+                            query_name = line
+                        elif idx > 0 and line == query_name:
+                            uniref_index = idx
                     else:
                         seqs.append(line)
-            return heads, seqs
+            return heads, seqs, uniref_index
 
         def make_pairing_and_non_pairing_msa(
             query_seq: str,
@@ -261,18 +367,22 @@ class RequestParser(object):
             uniref_to_ncbi_taxid: Mapping[str, str],
         ) -> List[str]:
 
-            heads, msa_seqs = read_a3m(raw_a3m_path)
+            heads, msa_seqs, uniref_index = read_a3m(raw_a3m_path)
             uniref100_lines = [">query\n", f"{query_seq}\n"]
             other_lines = [">query\n", f"{query_seq}\n"]
 
-            for head, msa_seq in zip(heads, msa_seqs):
+            for idx, (head, msa_seq) in enumerate(zip(heads, msa_seqs)):
                 if msa_seq.rstrip("\n") == query_seq:
                     continue
 
-                if "UniRef" in head:
-                    uniref_id = head.split("\t")[0][1:]
-                    ncbi_taxid = uniref_to_ncbi_taxid.get(uniref_id, None)
-                    if ncbi_taxid is not None:
+                uniref_id = head.split("\t")[0][1:]
+                ncbi_taxid = uniref_to_ncbi_taxid.get(uniref_id, None)
+                if (ncbi_taxid is not None) and (idx < (uniref_index // 2)):
+                    if not uniref_id.startswith("UniRef100_"):
+                        head = head.replace(
+                            uniref_id, f"UniRef100_{uniref_id}_{ncbi_taxid}/"
+                        )
+                    else:
                         head = head.replace(uniref_id, f"{uniref_id}_{ncbi_taxid}/")
                     uniref100_lines.extend([head, msa_seq])
                 else:
@@ -290,7 +400,7 @@ class RequestParser(object):
             seq_dir: str,
             raw_a3m_path: str,
         ):
-            heads, msa_seqs = read_a3m(raw_a3m_path)
+            heads, msa_seqs, _ = read_a3m(raw_a3m_path)
             other_lines = [">query\n", f"{query_seq}\n"]
             for head, msa_seq in zip(heads, msa_seqs):
                 if msa_seq.rstrip("\n") == query_seq:
@@ -352,23 +462,20 @@ class RequestParser(object):
 
     def launch(self) -> None:
         input_json_path = self.get_data_json()
-        checkpoint_path = self.get_model()
+        checkpoint_dir = self.get_model()
 
         entry_path = os.path.abspath(
             opjoin(os.path.dirname(self.fpath), "../../runner/inference.py")
         )
         command_parts = [
-            "export LAYERNORM_TYPE=fast_layernorm;",
             f"python3 {entry_path}",
-            f"--load_checkpoint_path {checkpoint_path}",
+            f"--load_checkpoint_dir {checkpoint_dir}",
+            f"--model_name {self.model_name}",
             f"--dump_dir {self.request_dir}",
             f"--input_json_path {input_json_path}",
             f"--need_atom_confidence {self.request['atom_confidence']}",
             f"--use_msa {self.request['use_msa']}",
             "--num_workers 0",
-            "--dtype bf16",
-            "--use_deepspeed_evo_attention True",
-            "--sample_diffusion.step_scale_eta 1.5",
         ]
 
         if "model_seeds" in self.request:
@@ -379,14 +486,42 @@ class RequestParser(object):
                 command_parts.extend([f"--sample_diffusion.{key} {self.request[key]}"])
         if "N_cycle" in self.request:
             command_parts.extend([f"--model.N_cycle {self.request['N_cycle']}"])
+
+        if self.request.get("use_template", False):
+            command_parts.extend(
+                [f"--use_template {self.request.get('use_template', False)}"]
+            )
         command = " ".join(command_parts)
         print(f"Launching inference process with the command below:\n{command}")
         subprocess.call(command, shell=True)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--request_json_path",
+        type=str,
+        required=True,
+        help="Path to the request JSON file.",
+    )
+    parser.add_argument(
+        "--request_dir", type=str, required=True, help="Path to the request directory."
+    )
+    parser.add_argument(
+        "--email", type=str, required=False, default="", help="Your email address."
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="protenix_base_default_v1.0.0",
+        help="The model name for inference.",
+    )
+
+    args = parser.parse_args()
     parser = RequestParser(
-        request_json_path="/path/to/sample.json",
-        request_dir="./requests/debug",
+        request_json_path=args.request_json_path,
+        request_dir=args.request_dir,
+        email=args.email,
+        model_name=args.model_name,
     )
     parser.launch()

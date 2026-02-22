@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FoldBench Inference Telemetry v1",
+  "type": "object",
+  "required": [
+    "run_id",
+    "model",
+    "model_id",
+    "checkpoint_name",
+    "training_cutoff",
+    "comparability_label",
+    "analysis_set",
+    "target_id",
+    "seed",
+    "sample",
+    "phase",
+    "start_ts",
+    "end_ts",
+    "duration_s",
+    "ok",
+    "terminal_status"
+  ],
+  "properties": {
+    "run_id": {"type": "string"},
+    "model": {"type": "string"},
+    "model_id": {"type": "string"},
+    "checkpoint_name": {"type": "string"},
+    "training_cutoff": {"type": "string"},
+    "comparability_label": {"type": "string", "enum": ["strict_comparable", "reference_only"]},
+    "analysis_set": {"type": "string", "enum": ["FULL_2023PLUS", "SUBSET_2024PLUS"]},
+    "target_id": {"type": "string"},
+    "seed": {"type": "integer"},
+    "sample": {"type": "integer"},
+    "phase": {"type": "string", "enum": ["inference"]},
+    "start_ts": {"type": "string"},
+    "end_ts": {"type": "string"},
+    "duration_s": {"type": "number", "minimum": 0},
+    "ok": {"type": "boolean"},
+    "terminal_status": {
+      "type": "string",
+      "enum": ["success", "timeout", "oom", "runtime_error", "invalid_output", "missing_ground_truth"]
+    },
+    "error_class": {"type": "string"},
+    "gpu_name": {"type": "string"},
+    "max_gpu_mem_mb": {"type": "number"},
+    "ranking_score": {"type": "number"}
+  }
+}

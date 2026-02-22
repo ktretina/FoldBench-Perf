@@ -30,22 +30,28 @@ basic_configs = {
     "checkpoint_interval": -1,
     "eval_first": False,  # run evaluate() before training steps
     "iters_to_accumulate": 1,
+    "finetune_params_with_substring": [
+        ""
+    ],  # params with substring will be finetuned with different learning rate: finetune_optim_configs["lr"]
     "eval_only": False,
     "load_checkpoint_path": "",
     "load_ema_checkpoint_path": "",
-    "load_strict": False,
+    "load_strict": True,
     "load_params_only": True,
     "skip_load_step": False,
     "skip_load_optimizer": False,
     "skip_load_scheduler": False,
+    "load_step_for_scheduler": False,
     "train_confidence_only": False,
     "use_wandb": True,
     "wandb_id": "",
     "seed": 42,
     "deterministic": False,
+    "deterministic_seed": False,
     "ema_decay": -1.0,
     "eval_ema_only": False,  # whether wandb only tracking ema checkpoint metrics
     "ema_mutable_param_keywords": [""],
+    "model_name": "protenix_base_default_v1.0.0",  # train model name
 }
 data_configs = {
     # Data
@@ -57,6 +63,11 @@ data_configs = {
     "test_lig_atom_rename": False,
     "test_shuffle_mols": False,
     "test_shuffle_sym_ids": False,
+    "esm": {
+        "enable": False,
+        "model_name": "esm2-3b",
+        "embedding_dim": 2560,
+    },
 }
 optim_configs = {
     # Optim
@@ -83,7 +94,20 @@ optim_configs = {
         "lr": GlobalConfigValue("lr"),
     },
 }
+# Fine-tuned optimizer settings.
+# For models supporting structural constraints and ESM embeddings.
+finetune_optim_configs = {
+    # Optim
+    "lr": 0.0018,
+    "lr_scheduler": "cosine_annealing",
+    "warmup_steps": 1000,
+    "max_steps": 20000,
+    "min_lr_ratio": 0.1,
+    "decay_every_n_steps": 50000,
+}
 model_configs = {
+    "mc_dropout_apply_rate": 0.4,
+    "mc_dropout_rate": 0.4,
     # Model
     "c_s": 384,
     "c_z": 128,
@@ -100,27 +124,38 @@ model_configs = {
     "blocks_per_ckpt": ValueMaybeNone(
         1
     ),  # NOTE: Number of blocks in each activation checkpoint, if None, no checkpointing is performed.
+    "hidden_scale_up": False,  # whether to scale up hidden dim in pairformer and confidence head
     # switch of kernels
-    "use_memory_efficient_kernel": False,
-    "use_deepspeed_evo_attention": True,
-    "use_flash": False,
-    "use_lma": False,
-    "use_xformer": False,
+    "triangle_multiplicative": "cuequivariance",  # cuequivariance, torch
+    "triangle_attention": "cuequivariance",  # triattention, cuequivariance, deepspeed, torch
+    "enable_diffusion_shared_vars_cache": False,
+    "enable_efficient_fusion": False,
+    "enable_tf32": False,
     "find_unused_parameters": False,
     "dtype": "bf16",  # default training dtype: bf16
     "loss_metrics_sparse_enable": True,  # the swicth for both sparse lddt metrics and sparse bond/smooth lddt loss
     "skip_amp": {
         "sample_diffusion": True,
-        "confidence_head": True,
+        # If confidence_head (below) set to True and triangle_attention set to cuequivariance,
+        # RuntimeError: ERROR: Full precision FP32 backward pass for triangle attention is not
+        # implemented yet! Please set torch.backends.cuda.matmul.allow_tf32=True.
+        "confidence_head": False,
         "sample_diffusion_training": True,
         "loss": True,
     },
     "infer_setting": {
         "chunk_size": ValueMaybeNone(
-            64
+            256
         ),  # should set to null for normal training and small dataset eval [for efficiency]
+        "dynamic_chunk_size": True,
+        "chunk_size_thresholds": {
+            "1024": -1,  # -1 means no chunking (equivalent to None)
+            "1536": 512,
+            "2048": 256,
+            "2560": 128,
+        },
         "sample_diffusion_chunk_size": ValueMaybeNone(
-            1
+            5
         ),  # should set to null for normal training and small dataset eval [for efficiency]
         "lddt_metrics_sparse_enable": GlobalConfigValue("loss_metrics_sparse_enable"),
         "lddt_metrics_chunk_size": ValueMaybeNone(
@@ -151,6 +186,8 @@ model_configs = {
     "model": {
         "N_model_seed": 1,  # for inference
         "N_cycle": 4,
+        "condition_embedding_drop_rate": 0.0,
+        "confidence_embedding_drop_rate": 0.0,
         "input_embedder": {
             "c_atom": GlobalConfigValue("c_atom"),
             "c_atompair": GlobalConfigValue("c_atompair"),
@@ -167,6 +204,7 @@ model_configs = {
             "n_blocks": 0,
             "dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
         },
         "msa_module": {
             "c_m": 64,
@@ -176,6 +214,36 @@ model_configs = {
             "msa_dropout": 0.15,
             "pair_dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
+            "msa_chunk_size": ValueMaybeNone(2048),
+            "msa_max_size": 16384,
+        },
+        # Optional constraint embedder, only used when constraint is enabled.
+        "constraint_embedder": {
+            "pocket_embedder": {
+                "enable": False,
+                "c_s_input": 3,
+                "c_z_input": 1,
+            },
+            "contact_embedder": {
+                "enable": False,
+                "c_z_input": 2,
+            },
+            "substructure_embedder": {
+                "enable": False,
+                "n_classes": 4,
+                "architecture": "transformer",
+                "hidden_dim": 128,
+                "n_layers": 1,
+            },
+            "contact_atom_embedder": {
+                "enable": False,
+                "c_z_input": 2,
+            },
+            "c_constraint_z": GlobalConfigValue("c_z"),
+            "c_constraint_s": GlobalConfigValue("c_s_inputs"),
+            "c_constraint_atom_pair": GlobalConfigValue("c_atompair"),
+            "initialize_method": "zero",  # zero, kaiming
         },
         "pairformer": {
             "n_blocks": GlobalConfigValue("n_blocks"),
@@ -184,6 +252,7 @@ model_configs = {
             "n_heads": 16,
             "dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
         },
         "diffusion_module": {
             "use_fine_grained_checkpoint": True,
@@ -194,17 +263,6 @@ model_configs = {
             "c_z": GlobalConfigValue("c_z"),
             "c_s": GlobalConfigValue("c_s"),
             "c_s_inputs": GlobalConfigValue("c_s_inputs"),
-            "initialization": {
-                "zero_init_condition_transition": False,
-                "zero_init_atom_encoder_residual_linear": False,
-                "he_normal_init_atom_encoder_small_mlp": False,
-                "he_normal_init_atom_encoder_output": False,
-                "glorot_init_self_attention": False,
-                "zero_init_adaln": True,
-                "zero_init_residual_condition_transition": False,
-                "zero_init_dit_output": True,
-                "zero_init_atom_decoder_linear": False,
-            },
             "atom_encoder": {
                 "n_blocks": 3,
                 "n_heads": 4,
@@ -227,6 +285,7 @@ model_configs = {
             "max_atoms_per_token": GlobalConfigValue("max_atoms_per_token"),
             "pairformer_dropout": 0.0,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
             "distance_bin_start": 3.25,
             "distance_bin_end": 52.0,
             "distance_bin_step": 1.25,
@@ -273,7 +332,7 @@ loss_configs = {
     "loss": {
         "diffusion_lddt_chunk_size": ValueMaybeNone(1),
         "diffusion_bond_chunk_size": ValueMaybeNone(1),
-        "diffusion_chunk_size_outer": ValueMaybeNone(-1),
+        "diffusion_chunk_size_outer": ValueMaybeNone(1),
         "diffusion_sparse_loss_enable": GlobalConfigValue("loss_metrics_sparse_enable"),
         "diffusion_lddt_loss_dense": True,  # only set true in initial training for training speed
         "resolution": {"min": 0.1, "max": 4.0},
@@ -351,3 +410,4 @@ configs = {
     **perm_configs,
     **loss_configs,
 }
+configs["finetune"] = finetune_optim_configs

@@ -1,0 +1,66 @@
+version: 2
+benchmark: FoldBench
+
+required_models:
+  - Protenix-v1
+  - Protenix-v1-20250630
+
+hardware:
+  gpu_type_required: "same-class-across-models"
+  gpu_count: 1
+  isolation:
+    allow_background_gpu_jobs: false
+    capture_gpu_baseline: true
+
+runtime_controls:
+  precision_mode: "fixed-per-study (document exact mode)"
+  seed_policy:
+    seed_list: [0]
+    samples_per_target: 1
+  timeout_seconds_per_target: 1800
+  retry_policy:
+    retries: 1
+    backoff_seconds: [30]
+
+threading_controls:
+  OMP_NUM_THREADS: 1
+  MKL_NUM_THREADS: 1
+  PYTHONHASHSEED: 0
+
+timing_policy:
+  exclude:
+    - container_build
+    - checkpoint_download
+    - first_time_cache_population
+  include:
+    - per_target_inference_walltime
+  report_separately:
+    - preprocess_walltime
+    - postprocess_walltime
+    - evaluation_walltime
+
+failure_accounting:
+  required_terminal_status:
+    - success
+    - timeout
+    - oom
+    - runtime_error
+    - invalid_output
+    - missing_ground_truth
+  no_silent_drop: true
+
+data_policy:
+  analysis_sets_required:
+    - FULL_2023PLUS
+    - SUBSET_2024PLUS
+  unresolved_2024_ids: "must be explicitly listed and excluded deterministically"
+
+model_metadata_requirements:
+  required_fields:
+    - model_id
+    - checkpoint_name
+    - training_cutoff
+    - comparability_label
+  comparability_labels:
+    - strict_comparable
+    - reference_only

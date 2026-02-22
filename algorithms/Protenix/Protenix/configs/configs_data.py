@@ -15,8 +15,11 @@
 # pylint: disable=C0114,C0301
 import os
 from copy import deepcopy
+from pathlib import Path
 
 from protenix.config.extend_types import GlobalConfigValue, ListValue
+
+PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
 
 default_test_configs = {
     "sampler_configs": {
@@ -33,6 +36,10 @@ default_test_configs = {
     "lig_atom_rename": GlobalConfigValue("test_lig_atom_rename"),
     "shuffle_mols": GlobalConfigValue("test_shuffle_mols"),
     "shuffle_sym_ids": GlobalConfigValue("test_shuffle_sym_ids"),
+    "constraint": {
+        "enable": False,
+        "fix_seed": False,  # True means use use the same contact in each evaluation.
+    },
 }
 
 default_weighted_pdb_configs = {
@@ -58,41 +65,64 @@ default_weighted_pdb_configs = {
     "lig_atom_rename": GlobalConfigValue("train_lig_atom_rename"),
     "shuffle_mols": GlobalConfigValue("train_shuffle_mols"),
     "shuffle_sym_ids": GlobalConfigValue("train_shuffle_sym_ids"),
+    # If enabled, the training settings for different constraint types,
+    # providing the model a certain proportion of constraints
+    # that meet specific conditions.
+    "constraint": {
+        "enable": False,
+        "fix_seed": False,
+        "pocket": {
+            "prob": 0.0,
+            "size": 1 / 3,
+            "spec_binder_chain": False,
+            "max_distance_range": {"PP": ListValue([6, 20]), "LP": ListValue([6, 20])},
+            "group": "complex",
+            "distance_type": "center_atom",
+        },
+        "contact": {
+            "prob": 0.0,
+            "size": 1 / 3,
+            "max_distance_range": {
+                "PP": ListValue([6, 30]),
+                "PL": ListValue([4, 10]),
+            },
+            "group": "complex",
+            "distance_type": "center_atom",
+        },
+        "substructure": {
+            "prob": 0.0,
+            "size": 0.8,
+            "mol_type_pairs": {
+                "PP": 15,
+                "PL": 10,
+                "LP": 10,
+            },
+            "feature_type": "one_hot",
+            "ratios": {
+                "full": [
+                    0.0,
+                    0.5,
+                    1.0,
+                ],  # ratio options of full chain substructure constraint
+                "partial": 0.3,  # ratio of partial chain substructure constraint
+            },
+            "coord_noise_scale": 0.05,
+            "spec_asym_id": False,
+        },
+        "contact_atom": {
+            "prob": 0.0,
+            "size": 1 / 3,
+            "max_distance_range": {
+                "PP": ListValue([2, 12]),
+                "PL": ListValue([2, 8]),
+            },
+            "min_distance": -1,
+            "group": "complex",
+            "distance_type": "atom",
+            "feature_type": "continuous",
+        },
+    },
 }
-
-# DATA_ROOT_DIR = "/af3-dev/release_data/"
-DATA_ROOT_DIR = "/af3-dev/release_data/"
-# CCD_COMPONENTS_FILE_PATH = '/data1/qtfeng/dev/af3_benchmark/data/components.cif'
-# CCD_COMPONENTS_RDKIT_MOL_FILE_PATH='/data1/qtfeng/dev/af3_benchmark/data/components.cif.rdkit_mol.pkl'
-
-CCD_COMPONENTS_FILE_PATH = os.path.join(DATA_ROOT_DIR, "components.v20240608.cif")
-CCD_COMPONENTS_RDKIT_MOL_FILE_PATH = os.path.join(
-    DATA_ROOT_DIR, "components.v20240608.cif.rdkit_mol.pkl"
-)
-
-# This is a patch in inference stage for users that do not have root permission.
-# If you run
-# ```
-# bash inference_demo.sh
-# ```
-# or
-# ```
-# protenix predict --input examples/example.json --out_dir  ./output
-# ````
-# The checkpoint and the data cache will be downloaded to the current code directory.
-if (not os.path.exists(CCD_COMPONENTS_FILE_PATH)) or (
-    not os.path.exists(CCD_COMPONENTS_RDKIT_MOL_FILE_PATH)
-):
-    print("Try to find the ccd cache data in the code directory for inference.")
-    current_file_path = os.path.abspath(__file__)
-    current_directory = os.path.dirname(current_file_path)
-    code_directory = os.path.dirname(current_directory)
-
-    data_cache_dir = os.path.join(code_directory, "release_data/ccd_cache")
-    CCD_COMPONENTS_FILE_PATH = os.path.join(data_cache_dir, "components.v20240608.cif")
-    CCD_COMPONENTS_RDKIT_MOL_FILE_PATH = os.path.join(
-        data_cache_dir, "components.v20240608.cif.rdkit_mol.pkl"
-    )
 
 
 data_configs = {
@@ -108,10 +138,12 @@ data_configs = {
     "test_sets": ListValue(["recentPDB_1536_sample384_0925"]),
     "weightedPDB_before2109_wopb_nometalc_0925": {
         "base_info": {
-            "mmcif_dir": os.path.join(DATA_ROOT_DIR, "mmcif"),
-            "bioassembly_dict_dir": os.path.join(DATA_ROOT_DIR, "mmcif_bioassembly"),
+            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "bioassembly_dict_dir": os.path.join(
+                PROTENIX_ROOT_DIR, "mmcif_bioassembly"
+            ),
             "indices_fpath": os.path.join(
-                DATA_ROOT_DIR,
+                PROTENIX_ROOT_DIR,
                 "indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
             ),
             "pdb_list": "",
@@ -127,15 +159,15 @@ data_configs = {
     },
     "recentPDB_1536_sample384_0925": {
         "base_info": {
-            "mmcif_dir": os.path.join(DATA_ROOT_DIR, "mmcif"),
+            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
             "bioassembly_dict_dir": os.path.join(
-                DATA_ROOT_DIR, "recentPDB_bioassembly"
+                PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
             ),
             "indices_fpath": os.path.join(
-                DATA_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
+                PROTENIX_ROOT_DIR, "indices/recentPDB_low_homology_maxtoken1536.csv"
             ),
             "pdb_list": os.path.join(
-                DATA_ROOT_DIR,
+                PROTENIX_ROOT_DIR,
                 "indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
             ),
             "max_n_token": GlobalConfigValue("test_max_n_token"),  # filter data
@@ -147,12 +179,12 @@ data_configs = {
     },
     "posebusters_0925": {
         "base_info": {
-            "mmcif_dir": os.path.join(DATA_ROOT_DIR, "posebusters_mmcif"),
+            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "posebusters_mmcif"),
             "bioassembly_dict_dir": os.path.join(
-                DATA_ROOT_DIR, "posebusters_bioassembly"
+                PROTENIX_ROOT_DIR, "posebusters_bioassembly"
             ),
             "indices_fpath": os.path.join(
-                DATA_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
+                PROTENIX_ROOT_DIR, "indices/posebusters_indices_mainchain_interface.csv"
             ),
             "pdb_list": "",
             "find_pocket": True,
@@ -162,38 +194,68 @@ data_configs = {
         **deepcopy(default_test_configs),
     },
     "msa": {
-        "enable": True,
-        "enable_rna_msa": False,
-        "prot": {
-            "pairing_db": "uniref100",
-            "non_pairing_db": "mmseqs_other",
-            "pdb_mmseqs_dir": os.path.join(DATA_ROOT_DIR, "mmcif_msa"),
-            "seq_to_pdb_idx_path": os.path.join(DATA_ROOT_DIR, "seq_to_pdb_index.json"),
-            "indexing_method": "sequence",
-        },
-        "rna": {
-            "seq_to_pdb_idx_path": "",
-            "rna_msa_dir": "",
-            "indexing_method": "sequence",
-        },
-        "strategy": "random",
-        "merge_method": "dense_max",
+        "enable_prot_msa": True,
+        "prot_seq_or_filename_to_msadir_jsons": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
+        ),
+        "prot_msadir_raw_paths": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "mmcif_msa_template")]
+        ),
+        "prot_pairing_dbs": ListValue(["pairing"]),
+        "prot_non_pairing_dbs": ListValue(
+            ["pairing-non_pairing"]
+        ),  # Separated by "-", "pairing-non_pairing" means both pairing and non_pairing are used as non_pairing,
+        # with pairing used first.
+        "prot_indexing_methods": ListValue(["sequence"]),
+        "enable_rna_msa": True,  # enable rna msa
+        "rna_seq_or_filename_to_msadir_jsons": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/rna_sequence_to_pdb_chains.json")]
+        ),
+        "rna_msadir_raw_paths": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/msas")]
+        ),
+        "rna_indexing_methods": ListValue(["sequence"]),
         "min_size": {
             "train": 1,
-            "test": 2048,
+            "test": 1,
         },
         "max_size": {
             "train": 16384,
             "test": 16384,
         },
         "sample_cutoff": {
-            "train": 2048,
-            "test": 2048,
+            "train": 16384,
+            "test": 16384,
         },
     },
     "template": {
-        "enable": False,
+        "enable_prot_template": True,
+        "template_dropout_rate": 0.0,
+        "prot_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+        "prot_template_cache_dir": "",
+        "prot_template_raw_paths": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "mmcif_msa_template")]
+        ),
+        "prot_seq_or_filename_to_templatedir_jsons": ListValue(
+            [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
+        ),
+        "prot_indexing_methods": ListValue(["sequence"]),
+        "release_dates_path": os.path.join(
+            PROTENIX_ROOT_DIR, "common/release_date_cache.json"
+        ),
+        "obsolete_pdbs_path": os.path.join(
+            PROTENIX_ROOT_DIR, "common/obsolete_to_successor.json"
+        ),
+        "kalign_binary_path": "/usr/bin/kalign",  # apt-get install kalign
     },
-    "ccd_components_file": CCD_COMPONENTS_FILE_PATH,
-    "ccd_components_rdkit_mol_file": CCD_COMPONENTS_RDKIT_MOL_FILE_PATH,
+    "ccd_components_file": os.path.join(PROTENIX_ROOT_DIR, "common/components.cif"),
+    "ccd_components_rdkit_mol_file": os.path.join(
+        PROTENIX_ROOT_DIR, "common/components.cif.rdkit_mol.pkl"
+    ),
+    "obsolete_release_data_csv": os.path.join(
+        PROTENIX_ROOT_DIR, "common/obsolete_release_date.csv"
+    ),
+    "pdb_cluster_file": os.path.join(
+        PROTENIX_ROOT_DIR, "common/clusters-by-entity-40.txt"
+    ),
 }

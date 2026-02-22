@@ -56,17 +56,20 @@ def run(
             info_dict: a dictionary of logging.
     """
     try:
-        permuted_coord, permuted_mask, info_dict, indices_permutation = (
-            correct_symmetric_atoms(
-                pred_coord=pred_coord,
-                true_coord=true_coord,
-                true_coord_mask=true_coord_mask,
-                ref_space_uid=ref_space_uid,
-                atom_perm_list=atom_perm_list,
-                permute_label=permute_label,
-                alignment_mask=alignment_mask,
-                global_align_wo_symmetric_atom=global_align_wo_symmetric_atom,
-            )
+        (
+            permuted_coord,
+            permuted_mask,
+            info_dict,
+            indices_permutation,
+        ) = correct_symmetric_atoms(
+            pred_coord=pred_coord,
+            true_coord=true_coord,
+            true_coord_mask=true_coord_mask,
+            ref_space_uid=ref_space_uid,
+            atom_perm_list=atom_perm_list,
+            permute_label=permute_label,
+            alignment_mask=alignment_mask,
+            global_align_wo_symmetric_atom=global_align_wo_symmetric_atom,
         )
         if permute_label:
             return (
@@ -267,20 +270,20 @@ def collect_permuted_coords(
 
 
 class AtomPermutation(object):
+    """Class for assigning the optimal permutations of true coordinates/pred coordinates and coordinate masks.
+
+    Args:
+        eps (float): A small number used in alignment. Defaults to 1e-8.
+        run_checker (bool): If true, it applies more checkers to ensure the correctness. Defaults to False.
+        global_align_wo_symmetric_atom (bool):  If true, the global alignment before AtomPermutation will not consider atoms with permutation. Defaults to False.
+    """
+
     def __init__(
         self,
         eps: float = 1e-8,
         run_checker: bool = False,
         global_align_wo_symmetric_atom: bool = False,
     ):
-        """Class for assigning the optimal permutations of true coordinates/pred coordinates and coordinate masks.
-
-        Args:
-            eps (float): A small number used in alignment.
-            run_checker (bool): If true, it applies more checkers to ensure the correctness.
-            global_align_wo_symmetric_atom (bool):  If true, the global alignment before AtomPermutation will not consider atoms with permutation.
-        """
-
         self.eps = eps
         self.run_checker = run_checker
         self.global_align_wo_symmetric_atom = global_align_wo_symmetric_atom
@@ -338,7 +341,7 @@ class AtomPermutation(object):
         else:
             expand_func = lambda x: x
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             aligned_rmsd, transformed_pred_coord, _, _ = self_aligned_rmsd(
                 pred_pose=pred_coord.to(torch.float32),
                 true_pose=expand_func(true_coord.to(torch.float32)),
@@ -452,7 +455,7 @@ class AtomPermutation(object):
             permuted_coord_mask = expand_at_dim(permuted_coord_mask, dim=0, n=Batch)
 
         # Compute per-residue rmsd
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             per_res_rmsd = rmsd(
                 pred_pose=pred_coord.to(torch.float32),
                 true_pose=permuted_coord.to(torch.float32),
@@ -630,7 +633,7 @@ class AtomPermutation(object):
         )
         log_dict["unpermuted_rmsd"] = aligned_rmsd.mean().item()  # [Batch]
 
-        """ 
+        """
         To efficiently optimize the residues parallely, group the residues
         according to the number of atoms in each residue.
         """

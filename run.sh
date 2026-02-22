@@ -48,6 +48,16 @@ conda init
 . /root/miniconda3/etc/profile.d/conda.sh
 conda activate foldbench
 
+# Hard gate: true GPU path required
+GPU_CHECK_TARGET="algorithms/Protenix/container.sandbox"
+if [ ! -d "$GPU_CHECK_TARGET" ]; then
+    GPU_CHECK_TARGET="algorithms/Protenix/container.sif"
+fi
+if ! apptainer exec --nvccli "$GPU_CHECK_TARGET" nvidia-smi -L >/dev/null 2>&1; then
+    echo "ERROR: true GPU path check failed (apptainer --nvccli nvidia-smi -L). Aborting." >&2
+    exit 3
+fi
+
 # Loop through each algorithm in the algorithms directory
 for algorithm_dir in algorithms/*; do
 
@@ -72,15 +82,12 @@ for algorithm_dir in algorithms/*; do
                 mkdir -p "$input_dir"
                 mkdir -p "$evaluation_dir"
 
-                # Remove an existing container overlay, if any
-                rm -rf "algorithms/${algorithm_name}/overlay.img"
-                # Create writable overlay for the container
-                apptainer overlay create --size $overlay_size --sparse "algorithms/${algorithm_name}/overlay.img"
+                # No overlay image: EXT3 overlay mounts require loop device access
+                # that is not available on this host for unprivileged runs.
 
                 # Calculate predictions
                 echo "RUN ALGORITHM $algorithm_name"
-                { time ( apptainer exec --nv \
-                    --overlay "algorithms/${algorithm_name}/overlay.img" \
+                { time ( apptainer exec --userns --nvccli \
                     -B $af3_input_json:/algo/alphafold3_inputs.json \
                     -B $output_root_dir:/algo/outputs \
                     "algorithms/${algorithm_name}/container.sif" \
@@ -94,11 +101,7 @@ for algorithm_dir in algorithms/*; do
             else
                 echo "Skipping algorithm: $algorithm_name. Output file already exists."
 
-                # Remove an existing container overlay, if any
-                # FIXME: mb put this part outside if-else statement? 
-                # Now when each dataset has separate container overlays,
-                # old dataset overlays must be removed if output file already exists.
-                rm -rf "algorithms/${algorithm_name}/overlay.img"
+                # No overlay cleanup needed in no-overlay runtime mode.
             fi
 
         fi

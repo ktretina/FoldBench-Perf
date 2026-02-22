@@ -4,6 +4,7 @@ from evaluation import eval_by_dockqv2,eval_by_ost
 import pandas as pd
 import argparse
 import os
+import sys
 
 
 
@@ -34,7 +35,27 @@ target_types =  args.targets
 
 
 prediction_summary_path = f'{evaluation_dir}/prediction_reference.csv'
-prediction_summary_df = pd.read_csv(prediction_summary_path)
+if not os.path.exists(prediction_summary_path):
+    print(f"ERROR: prediction reference file missing: {prediction_summary_path}")
+    print("Hint: ensure inference postprocess generated prediction_reference.csv before running evaluate.py")
+    sys.exit(6)
+
+if os.path.getsize(prediction_summary_path) == 0:
+    print(f"ERROR: prediction reference file is empty: {prediction_summary_path}")
+    print("Hint: no predictions were indexed by postprocess; evaluation aborted fail-closed.")
+    sys.exit(7)
+
+try:
+    prediction_summary_df = pd.read_csv(prediction_summary_path)
+except pd.errors.EmptyDataError:
+    print(f"ERROR: prediction reference has no parseable columns: {prediction_summary_path}")
+    print("Hint: malformed/empty prediction_reference.csv; evaluation aborted fail-closed.")
+    sys.exit(8)
+
+if prediction_summary_df.empty:
+    print(f"ERROR: prediction reference has 0 rows: {prediction_summary_path}")
+    print("Hint: no predictions matched expected schema; evaluation aborted fail-closed.")
+    sys.exit(9)
 
 # caculation
 for target_type in target_types:

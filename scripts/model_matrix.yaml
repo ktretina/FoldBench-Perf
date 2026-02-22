@@ -1,0 +1,19 @@
+version: 1
+models:
+  - model_id: Protenix-v1
+    algorithm_name: Protenix
+    checkpoint_name: protenix_base_default_v1.0.0
+    training_cutoff: 2021-09-30
+    comparability_label: strict_comparable
+    notes: |
+      Benchmark/default version aligned to AlphaFold3-era fairness assumptions.
+      Targets released in 2023/2024/2025 are post-cutoff for this model.
+
+  - model_id: Protenix-v1-20250630
+    algorithm_name: Protenix
+    checkpoint_name: protenix_base_20250630_v1.0.0
+    training_cutoff: 2025-06-30
+    comparability_label: reference_only
+    notes: |
+      Applied variant trained on substantially newer data; potential leakage for
+      2023+/2024+ benchmark subsets. Must be reported separately from strict leaderboard.

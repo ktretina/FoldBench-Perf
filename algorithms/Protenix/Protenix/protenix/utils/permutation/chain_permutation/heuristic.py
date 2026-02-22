@@ -624,9 +624,9 @@ class MultiChainPermutation(object):
                 self.label_token_dict["coordinate"], rot, trans
             )
             for asym_id in self.label_asym_dict:
-                self.label_asym_dict[asym_id]["aligned_coordinate"] = (
-                    aligned_coordinate[self.label_token_dict["mol_id"] == asym_id]
-                )
+                self.label_asym_dict[asym_id][
+                    "aligned_coordinate"
+                ] = aligned_coordinate[self.label_token_dict["mol_id"] == asym_id]
 
             # Greedily matches all remaining chains
             matched_asym = {pred_anchor: gt_anchor}
@@ -741,7 +741,7 @@ class MultiChainPermutation(object):
             gt_center = label_asym_dict["aligned_coordinate"][mask].mean(dim=0)
             pred_center = pred_asym_dict["coordinate"][mask].mean(dim=0)
 
-            delta = torch.norm(gt_center - pred_center)
+            delta = torch.linalg.vector_norm(gt_center - pred_center)
 
             if delta < best_error:
                 best_error = delta
@@ -817,7 +817,7 @@ class MultiChainPermutation(object):
             float: The aligned RMSD value.
         """
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             aligned_rmsd, _, _, _ = self_aligned_rmsd(
                 pred_pose=pred_dict["coordinate"].to(torch.float32),
                 true_pose=label_full_dict["coordinate"][indices, :].to(torch.float32),

@@ -1,0 +1,412 @@
+{
+  "schema": "foldbench.microbatch.queue.v1",
+  "created_at_utc": "20260221T035356Z",
+  "source_af3_input_json": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/inputs/full_2023plus_shards/alphafold3_inputs_shard_001.json",
+  "batch_size": 5,
+  "job_total": 20,
+  "jobs_done": 0,
+  "jobs_failed": 0,
+  "jobs_quarantined": 0,
+  "jobs": [
+    {
+      "job_id": "job_0001",
+      "index": 1,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0001.json",
+      "target_names": [
+        "8tuz-assembly1",
+        "7xld-assembly1",
+        "8xnh-assembly1",
+        "8bf4-assembly1",
+        "8up2-assembly1"
+      ],
+      "target_count": 5,
+      "status": "running",
+      "attempts": 0,
+      "lease_owner": "worker_a6000_01",
+      "lease_expires_at_utc": "20260221T042412Z",
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0002",
+      "index": 2,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0002.json",
+      "target_names": [
+        "8pyr-assembly1",
+        "8pih-assembly1",
+        "8fdo-assembly1",
+        "8fdd-assembly1",
+        "7x8p-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0003",
+      "index": 3,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0003.json",
+      "target_names": [
+        "8h63-assembly1",
+        "8ux6-assembly1",
+        "8w90-assembly1",
+        "8e0e-assembly1",
+        "8hxq-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0004",
+      "index": 4,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0004.json",
+      "target_names": [
+        "8ido-assembly1",
+        "8be1-assembly1",
+        "7txw-assembly1",
+        "8ahn-assembly1",
+        "7yv1-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0005",
+      "index": 5,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0005.json",
+      "target_names": [
+        "8a44-assembly1",
+        "8tmz-assembly1",
+        "8fas-assembly1",
+        "7ua2-assembly1",
+        "8qf4-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0006",
+      "index": 6,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0006.json",
+      "target_names": [
+        "8gye-assembly1",
+        "8gy5-assembly1",
+        "9g2g-assembly1",
+        "8g4p-assembly1",
+        "8fbw-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0007",
+      "index": 7,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0007.json",
+      "target_names": [
+        "8ath-assembly1",
+        "9jbq-assembly1",
+        "8pmz-assembly1",
+        "7z2m-assembly1",
+        "8f60-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0008",
+      "index": 8,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0008.json",
+      "target_names": [
+        "8evd-assembly1",
+        "7st5-assembly1",
+        "8byu-assembly1",
+        "8d9z-assembly1",
+        "9fww-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0009",
+      "index": 9,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0009.json",
+      "target_names": [
+        "8vzo-assembly1",
+        "8the-assembly1",
+        "8sgn-assembly1",
+        "8jyr-assembly1",
+        "8jeo-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0010",
+      "index": 10,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0010.json",
+      "target_names": [
+        "7yxu-assembly1",
+        "8yxi-assembly1",
+        "8fxv-assembly1",
+        "8vvl-assembly1",
+        "8vui-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0011",
+      "index": 11,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0011.json",
+      "target_names": [
+        "8be3-assembly1",
+        "8be2-assembly1",
+        "9en2-assembly1",
+        "8en5-assembly1",
+        "9au1-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0012",
+      "index": 12,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0012.json",
+      "target_names": [
+        "8weo-assembly1",
+        "8q7o-assembly1",
+        "7ucx-assembly1",
+        "8j7t-assembly1",
+        "8vyl-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0013",
+      "index": 13,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0013.json",
+      "target_names": [
+        "7zau-assembly1",
+        "8c3l-assembly1",
+        "8sfz-assembly1",
+        "8slb-assembly1",
+        "8av2-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0014",
+      "index": 14,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0014.json",
+      "target_names": [
+        "8oxw-assembly1",
+        "8oxx-assembly1",
+        "8q6r-assembly1",
+        "8udz-assembly1",
+        "8w84-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0015",
+      "index": 15,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0015.json",
+      "target_names": [
+        "8oud-assembly1",
+        "8zp2-assembly1",
+        "8s0l-assembly1",
+        "8a67-assembly1",
+        "7yds-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0016",
+      "index": 16,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0016.json",
+      "target_names": [
+        "8rp8-assembly1",
+        "8b1a-assembly1",
+        "8z8v-assembly1",
+        "8dtn-assembly1",
+        "8fym-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0017",
+      "index": 17,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0017.json",
+      "target_names": [
+        "8r4u-assembly1",
+        "8trs-assembly1",
+        "7z1x-assembly1",
+        "8gho-assembly1",
+        "7uvs-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0018",
+      "index": 18,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0018.json",
+      "target_names": [
+        "8urf-assembly1",
+        "8dn7-assembly1",
+        "8aon-assembly1",
+        "8aok-assembly1",
+        "8aom-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0019",
+      "index": 19,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0019.json",
+      "target_names": [
+        "8im0-assembly1",
+        "8opr-assembly1",
+        "8h3x-assembly1",
+        "8oni-assembly1",
+        "8ts0-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    },
+    {
+      "job_id": "job_0020",
+      "index": 20,
+      "manifest": "/home/ktretina/.openclaw/workspace/github_projects/FoldBench/campaigns/strict_full_shard001_micro/queue_v1/manifests/job_0020.json",
+      "target_names": [
+        "8b7h-assembly1",
+        "8acf-assembly1",
+        "8t59-assembly1",
+        "8v52-assembly1",
+        "8che-assembly1"
+      ],
+      "target_count": 5,
+      "status": "pending",
+      "attempts": 0,
+      "lease_owner": null,
+      "lease_expires_at_utc": null,
+      "last_run_id": null,
+      "last_run_dir": null,
+      "last_error": null
+    }
+  ]
+}

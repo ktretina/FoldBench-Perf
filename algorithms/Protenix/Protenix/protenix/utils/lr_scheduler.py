@@ -16,7 +16,7 @@ import math
 import warnings
 
 import torch
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import ConstantLR, LRScheduler
 
 
 class CosineAnnealingWithWarmup(LRScheduler):
@@ -28,13 +28,12 @@ class CosineAnnealingWithWarmup(LRScheduler):
         lr: float,
         min_lr: float,
         last_epoch: int = -1,
-        verbose: bool = False,
     ):
         self.warmup_steps = warmup_steps
         self.decay_steps = decay_steps
         self.lr = lr
         self.min_lr = min_lr
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def _get_step_lr(self, step):
         if step <= self.warmup_steps:
@@ -70,7 +69,6 @@ class AlphaFold3LRScheduler(LRScheduler):
         self,
         optimizer: torch.optim.Optimizer,
         last_epoch: int = -1,
-        verbose: bool = False,
         warmup_steps: int = 1000,
         lr: float = 1.8e-3,
         decay_every_n_steps: int = 50000,
@@ -81,7 +79,7 @@ class AlphaFold3LRScheduler(LRScheduler):
         self.lr = lr
         self.decay_factor = decay_factor
         super(AlphaFold3LRScheduler, self).__init__(
-            optimizer=optimizer, last_epoch=last_epoch, verbose=verbose
+            optimizer=optimizer, last_epoch=last_epoch
         )
 
     def _get_step_lr(self, step):
@@ -102,6 +100,48 @@ class AlphaFold3LRScheduler(LRScheduler):
         return [
             self._get_step_lr(self.last_epoch) for group in self.optimizer.param_groups
         ]
+
+
+class ConstantLRScheduler(ConstantLR):
+    def __init__(self, optimizer, lr, last_epoch=-1):
+        self.lr = lr
+        super(ConstantLRScheduler, self).__init__(
+            optimizer, factor=1.0, last_epoch=last_epoch
+        )
+
+    def _get_step_lr(self, step):
+        return self.lr
+
+
+class FinetuneLRScheduler(LRScheduler):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        base_lr_config,
+        finetune_lr_config,
+        last_epoch: int = -1,
+    ) -> None:
+
+        self.lr_scheduler = get_lr_scheduler(base_lr_config, optimizer)
+        self.finetune_lr_scheduler = get_lr_scheduler(finetune_lr_config, optimizer)
+        super(FinetuneLRScheduler, self).__init__(
+            optimizer=optimizer, last_epoch=last_epoch
+        )
+
+    def _get_step_lr(self, step):
+        lr = self.lr_scheduler._get_step_lr(step)
+        ft_lr = self.finetune_lr_scheduler._get_step_lr(step)
+        # this order is same to the order in optimizer
+        return ft_lr, lr
+
+    def get_lr(self) -> list[float]:
+        if not self._get_lr_called_within_step:
+            warnings.warn(
+                "To get the last learning rate computed by the scheduler, "
+                "please use `get_last_lr()`.",
+                UserWarning,
+            )
+        return self._get_step_lr(self.last_epoch)
 
 
 def get_lr_scheduler(
@@ -135,10 +175,9 @@ def get_lr_scheduler(
             **kwargs,
         )
     elif configs.lr_scheduler == "constant":
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
+        lr_scheduler = ConstantLRScheduler(
             optimizer,
-            factor=1.0,
-            total_iters=configs.max_steps,
+            lr=configs.lr,
             **kwargs,
         )
     else:

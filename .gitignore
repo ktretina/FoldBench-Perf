@@ -7,3 +7,14 @@ __pycache__/
 *.ninja_deps.d
 *.ninja_deps.d.tmp
 *.ninja_deps.d.tmp.d
+
+# backup target excludes
+algorithms/Protenix/container.sandbox/
+.venv/
+runs/
+data/
+checkpoints/
+logs/
+**/*.pt
+
+algorithms/Protenix/Protenix.bak_pre_v1sync_20260220T073916/

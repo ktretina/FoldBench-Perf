@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 from ml_collections.config_dict import ConfigDict
@@ -21,18 +21,20 @@ from protenix.metrics.clash import Clash
 from protenix.utils.distributed import traverse_and_aggregate
 
 
-def merge_per_sample_confidence_scores(summary_confidence_list: list[dict]) -> dict:
+def merge_per_sample_confidence_scores(
+    summary_confidence_list: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
     Merge confidence scores from multiple samples into a single dictionary.
 
     Args:
-        summary_confidence_list (list[dict]): List of dictionaries containing confidence scores for each sample.
+        summary_confidence_list (list[dict[str, Any]]): List of dictionaries containing confidence scores for each sample.
 
     Returns:
-        dict: Merged dictionary of confidence scores.
+        dict[str, Any]: Merged dictionary of confidence scores.
     """
 
-    def stack_score(tensor_list: list):
+    def stack_score(tensor_list: list[torch.Tensor]) -> torch.Tensor:
         if tensor_list[0].dim() == 0:
             tensor_list = [x.unsqueeze(0) for x in tensor_list]
         score = torch.stack(tensor_list, dim=0)
@@ -122,6 +124,14 @@ def _compute_full_data_and_summary(
         **get_bin_params(configs.loss.pae)
     )  # [N_s, ]
 
+    # Add: 'chain_gpde', 'chain_pair_gpde'
+    summary_confidence.update(
+        calculate_chain_based_gpde(
+            token_pair_pde=full_data["token_pair_pde"],
+            contact_probs=full_data["contact_probs"],
+            asym_id=token_asym_id,
+        )
+    )
     # Add: 'chain_pair_iptm', 'chain_pair_iptm_global' 'chain_iptm', 'chain_ptm'
     summary_confidence.update(
         calculate_chain_based_ptm(
@@ -149,7 +159,7 @@ def _compute_full_data_and_summary(
     summary_confidence["num_recycles"] = torch.tensor(
         N_recycle, device=atom_coordinate.device
     )
-    # TODO: disorder
+
     summary_confidence["disorder"] = torch.zeros_like(summary_confidence["ptm"])
     summary_confidence["ranking_score"] = (
         0.8 * summary_confidence["iptm"]
@@ -189,7 +199,7 @@ def _compute_full_data_and_summary(
     summary_confidence = break_down_to_per_sample_dict(
         summary_confidence, shared_keys=["num_recycles"]
     )
-    torch.cuda.empty_cache()
+
     if return_full_data:
         # save extra inputs that are used for computing summary_confidence
         full_data["token_has_frame"] = token_has_frame.clone()
@@ -248,6 +258,7 @@ def compute_contact_prob(
     distogram_bins = get_bin_centers(min_bin, max_bin, no_bins)
     thres_idx = (distogram_bins < thres).sum()
     contact_prob = distogram_prob[..., :thres_idx].sum(-1)
+    del distogram_prob
     return contact_prob
 
 
@@ -311,7 +322,7 @@ def logits_to_score(
         return score
 
 
-def calculate_normalization(N):
+def calculate_normalization(N: int) -> float:
     # TM-score normalization constant
     return 1.24 * (max(N, 19) - 15) ** (1 / 3) - 1.8
 
@@ -573,6 +584,67 @@ def calculate_chain_based_ptm(
     }
 
 
+def calculate_chain_based_gpde(
+    token_pair_pde: torch.Tensor,
+    contact_probs: torch.Tensor,
+    asym_id: torch.LongTensor,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Calculate chain-based gPDE values.
+
+    Args:
+        token_pair_pde (torch.Tensor): PDE (Predicted Distance Error) of token-token pairs.
+            [..., N_token, N_token]
+        contact_probs (torch.Tensor): Contact probabilities.
+            [..., N_token, N_token]
+        asym_id (torch.LongTensor): Asymmetric ID for tokens.
+
+    Returns:
+        dict[str, torch.Tensor]: Dictionary containing chain-based gPDE values.
+            - chain_gpde (torch.Tensor): Intra-chain gPDE.
+            - chain_pair_gpde (torch.Tensor): Interface gPDE.
+    """
+
+    asym_id = asym_id.long()
+    unique_asym_ids = torch.unique(asym_id)
+    N_chain = len(unique_asym_ids)
+    assert N_chain == asym_id.max() + 1  # make sure it is from 0 to N_chain-1
+
+    batch_shape = token_pair_pde.shape[:-2]
+    device = token_pair_pde.device
+
+    def _cal_gpde(token_mask_1, token_mask_2):
+        masked_contact_probs = contact_probs[..., token_mask_1, :][..., token_mask_2]
+        masked_pde = token_pair_pde[..., token_mask_1, :][..., token_mask_2]
+        return (masked_pde * masked_contact_probs).sum(dim=(-1, -2)) / (
+            masked_contact_probs.sum(dim=(-1, -2)) + eps
+        )
+
+    # Chain_gpde
+    chain_gpde = torch.zeros(size=batch_shape + (N_chain,), device=device)
+    for aid in range(N_chain):
+        chain_gpde[..., aid] = _cal_gpde(
+            token_mask_1=asym_id == aid,
+            token_mask_2=asym_id == aid,
+        )
+
+    # Chain_pair_pde
+    chain_pair_gpde = torch.zeros(size=batch_shape + (N_chain, N_chain), device=device)
+    for aid_1 in range(N_chain):
+        for aid_2 in range(N_chain):
+            if aid_1 == aid_2:
+                continue
+            if aid_2 < aid_1:
+                chain_pair_gpde[..., aid_1, aid_2] = chain_pair_gpde[..., aid_2, aid_1]
+                continue
+            chain_pair_gpde[..., aid_1, aid_2] = _cal_gpde(
+                token_mask_1=asym_id == aid_1,
+                token_mask_2=asym_id == aid_2,
+            )
+
+    return {"chain_gpde": chain_gpde, "chain_pair_gpde": chain_pair_gpde}
+
+
 def calculate_chain_based_plddt(
     atom_plddt: torch.Tensor,
     asym_id: torch.LongTensor,
@@ -636,7 +708,7 @@ def calculate_iptm(
     no_bins: int,
     token_mask: Optional[torch.BoolTensor] = None,
     eps: float = 1e-8,
-):
+) -> torch.Tensor:
     """
     Compute ipTM score.
 
@@ -690,16 +762,18 @@ def calculate_iptm(
     return iptm
 
 
-def break_down_to_per_sample_dict(input_dict: dict, shared_keys=[]) -> list[dict]:
+def break_down_to_per_sample_dict(
+    input_dict: dict[str, Any], shared_keys: list[str] = []
+) -> list[dict[str, Any]]:
     """
     Break down a dictionary containing tensors into a list of dictionaries, each corresponding to a sample.
 
     Args:
-        input_dict (dict): Dictionary containing tensors.
-        shared_keys (list): List of keys that are shared across all samples. Defaults to an empty list.
+        input_dict (dict[str, Any]): Dictionary containing tensors.
+        shared_keys (list[str]): List of keys that are shared across all samples. Defaults to an empty list.
 
     Returns:
-        list[dict]: List of dictionaries, each containing data for a single sample.
+        list[dict[str, Any]]: List of dictionaries, each containing data for a single sample.
     """
     per_sample_keys = [key for key in input_dict if key not in shared_keys]
     assert len(per_sample_keys) > 0
@@ -718,22 +792,22 @@ def break_down_to_per_sample_dict(input_dict: dict, shared_keys=[]) -> list[dict
 
 @torch.no_grad()
 def compute_full_data_and_summary(
-    configs,
-    pae_logits,
-    plddt_logits,
-    pde_logits,
-    contact_probs,
-    token_asym_id,
-    token_has_frame,
-    atom_coordinate,
-    atom_to_token_idx,
-    atom_is_polymer,
-    N_recycle,
+    configs: ConfigDict,
+    pae_logits: torch.Tensor,
+    plddt_logits: torch.Tensor,
+    pde_logits: torch.Tensor,
+    contact_probs: torch.Tensor,
+    token_asym_id: torch.Tensor,
+    token_has_frame: torch.Tensor,
+    atom_coordinate: torch.Tensor,
+    atom_to_token_idx: torch.Tensor,
+    atom_is_polymer: torch.Tensor,
+    N_recycle: int,
     return_full_data: bool = False,
-    interested_atom_mask=None,
-    mol_id=None,
-    elements_one_hot=None,
-):
+    interested_atom_mask: Optional[torch.Tensor] = None,
+    mol_id: Optional[torch.Tensor] = None,
+    elements_one_hot: Optional[torch.Tensor] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Wrapper of `_compute_full_data_and_summary` by enumerating over N samples"""
 
     N_sample = pae_logits.size(0)
